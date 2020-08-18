@@ -1,1 +1,9 @@
+<<<<<<< HEAD
 SQL-Performance-Baseline/CREATEDATABASE.sql
+=======
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs
+>>>>>>> upstream/master

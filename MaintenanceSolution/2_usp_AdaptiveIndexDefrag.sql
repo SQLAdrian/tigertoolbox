@@ -1,6 +1,7 @@
 -- If you are using AdaptiveIndexDefrag together with the maintenance plans in http://blogs.msdn.com/b/blogdoezequiel/archive/2012/09/18/about-maintenance-plans-grooming-sql-server.aspx
 -- please note that the job that runs AdaptiveIndexDefrag is expecting msdb. As such, change the database context accordingly.
 
+-- For deployment in Azure SQL Database, remove or comment the USE statement below.
 USE msdb
 GO
 
@@ -197,6 +198,7 @@ CREATE TABLE dbo.tbl_AdaptiveIndexDefrag_Working
 	, is_hypothetical bit
 	, has_filter bit
 	, allow_page_locks bit
+	, compression_type NVARCHAR(60) NULL -- 0 = NONE; 1 = ROW; 2 = PAGE; 3 = COLUMNSTORE; 4 = COLUMNSTORE_ARCHIVE
 	, range_scan_count bigint NULL
 	, record_count bigint
 	, [type] tinyint -- 0 = Heap; 1 = Clustered; 2 = Nonclustered; 3 = XML; 4 = Spatial; 5 = Clustered columnstore; 6 = Nonclustered columnstore; 7 = Nonclustered hash
@@ -232,7 +234,7 @@ CREATE TABLE dbo.tbl_AdaptiveIndexDefrag_Stats_log
 	(statsUpdate_id int identity(1,1) NOT NULL
 	, dbID int NOT NULL
 	, dbName NVARCHAR(128) NULL
-	, objectID int NOT NULL
+	, objectID int NULL
 	, objectName NVARCHAR(256) NULL
 	, statsID int NOT NULL
 	, statsName NVARCHAR(256) NULL
@@ -312,24 +314,25 @@ FROM dbo.tbl_AdaptiveIndexDefrag_Stats_log_old;')
 		END
 
 		IF EXISTS(SELECT [object_id] FROM sys.tables WHERE [name] = 'tbl_AdaptiveIndexDefrag_Exceptions') AND EXISTS(SELECT [object_id] FROM sys.tables WHERE [name] = 'tbl_AdaptiveIndexDefrag_Exceptions_old')
-		INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Exceptions ([dbID],[objectID],[indexID],[dbName]
-			,[objectName],[indexName],[exclusionMask])
-		SELECT [dbID],[objectID],[indexID],[dbName]
-			,[objectName],[indexName],[exclusionMask]
+		INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Exceptions ([dbID],[objectID],[indexID],[dbName],[objectName],[indexName],[exclusionMask])
+		SELECT [dbID],[objectID],[indexID],[dbName],[objectName],[indexName],[exclusionMask]
 		FROM dbo.tbl_AdaptiveIndexDefrag_Exceptions_old;
 		
 		IF EXISTS(SELECT [object_id] FROM sys.tables WHERE [name] = 'tbl_AdaptiveIndexDefrag_Working') AND EXISTS(SELECT [object_id] FROM sys.tables WHERE [name] = 'tbl_AdaptiveIndexDefrag_Working_old')
-		INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Working ([dbID],[objectID],[indexID],[partitionNumber]
-			,[dbName],[schemaName],[objectName],[indexName],[fragmentation]
-			,[page_count],[fill_factor],[is_disabled],[is_padded],[is_hypothetical]
-			,[has_filter],[allow_page_locks],[range_scan_count],[record_count]
-			,[type],[scanDate],[defragDate],[printStatus],[exclusionMask])
-		SELECT [dbID],[objectID],[indexID],[partitionNumber],[dbName]
-			,[schemaName],[objectName],[indexName],[fragmentation],[page_count]
-			,[fill_factor],[is_disabled],[is_padded],[is_hypothetical],[has_filter]
-			,[allow_page_locks],[range_scan_count],[record_count],[type],[scanDate]
-			,[defragDate],[printStatus],[exclusionMask]
-		FROM dbo.tbl_AdaptiveIndexDefrag_Working_old;
+		BEGIN
+			IF EXISTS (SELECT sc.column_id FROM sys.tables st INNER JOIN sys.columns sc ON st.[object_id] = sc.[object_id] WHERE (sc.[name] = 'compression_type') AND st.[name] = 'tbl_AdaptiveIndexDefrag_Working_old')
+			BEGIN
+				EXEC ('INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Working ([dbID],[objectID],[indexID],[partitionNumber],[dbName],[schemaName],[objectName],[indexName],[fragmentation],[page_count],[fill_factor],[is_disabled],[is_padded],[is_hypothetical],[has_filter],[allow_page_locks],[compression_type],[range_scan_count],[record_count],[type],[scanDate],[defragDate],[printStatus],[exclusionMask])
+SELECT [dbID],[objectID],[indexID],[partitionNumber],[dbName],[schemaName],[objectName],[indexName],[fragmentation],[page_count],[fill_factor],[is_disabled],[is_padded],[is_hypothetical],[has_filter],[allow_page_locks],[compression_type],[range_scan_count],[record_count],[type],[scanDate],[defragDate],[printStatus],[exclusionMask]
+FROM dbo.tbl_AdaptiveIndexDefrag_Working_old;')
+			END
+			ELSE
+			BEGIN
+				EXEC ('INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Working ([dbID],[objectID],[indexID],[partitionNumber],[dbName],[schemaName],[objectName],[indexName],[fragmentation],[page_count],[fill_factor],[is_disabled],[is_padded],[is_hypothetical],[has_filter],[allow_page_locks],[range_scan_count],[record_count],[type],[scanDate],[defragDate],[printStatus],[exclusionMask])
+SELECT [dbID],[objectID],[indexID],[partitionNumber],[dbName],[schemaName],[objectName],[indexName],[fragmentation],[page_count],[fill_factor],[is_disabled],[is_padded],[is_hypothetical],[has_filter],[allow_page_locks],[range_scan_count],[record_count],[type],[scanDate],[defragDate],[printStatus],[exclusionMask]
+FROM dbo.tbl_AdaptiveIndexDefrag_Working_old;')
+			END
+		END
 		
 		IF EXISTS(SELECT [object_id] FROM sys.tables WHERE [name] = 'tbl_AdaptiveIndexDefrag_Stats_Working') AND EXISTS(SELECT [object_id] FROM sys.tables WHERE [name] = 'tbl_AdaptiveIndexDefrag_Stats_Working_old')
 		BEGIN
@@ -471,10 +474,12 @@ CREATE PROCEDURE dbo.usp_AdaptiveIndexDefrag
 		/* Options are LIMITED, SAMPLED, and DETAILED */
 	, @onlineRebuild bit = 0
 		/* 1 = online rebuild; 0 = offline rebuild; only in Enterprise Edition */
+	, @resumableRebuild bit = 0
+		/* 1 = resumable rebuild; 0 = normal rebuild */		
 	, @sortInTempDB bit = 0	
 		/* 1 = perform sort operation in TempDB; 0 = perform sort operation in the indexes database */
 	, @maxDopRestriction tinyint = NULL
-		/* Option to restrict the number of processors for the operation; only in Enterprise Edition */
+		/* Option to restrict the number of processors for both index and statistics operations; only in Enterprise Edition */
 	, @updateStats bit = 1
 		/* 1 = updates stats when reorganizing; 0 = does not update stats when reorganizing */
 	, @updateStatsWhere bit = 0
@@ -515,13 +520,18 @@ CREATE PROCEDURE dbo.usp_AdaptiveIndexDefrag
 	, @getBlobfrag bit = 0
 		/* 0 = (default) exclude blobs from fragmentation scan.
 		1 = include blobs and off-row data when scanning for fragmentation.*/
+	, @dataCompression NVARCHAR(4) = NULL
+		/* NULL = (default) Keeps whatever compression setting exists for the object and partition; 
+		NONE = Forces no compression (and removes compression if set);
+		PAGE = Forces page compression;
+		ROW = Forces row compression.*/
 AS
 /*
-usp_AdaptiveIndexDefrag.sql - pedro.lopes@microsoft.com (http://blogs.msdn.com/b/blogdoezequiel/)
+usp_AdaptiveIndexDefrag.sql - pedro.lopes@microsoft.com (http://aka.ms/AID)
 
-Inspired by Michelle Ufford (http://sqlfool.com)
+v1 inspired by Michelle Ufford (http://sqlfool.com)
 
-PURPOSE: Intelligent defrag on one or more indexes for one or more databases.
+PURPOSE: Intelligent defrag on one or more indexes and statistics update for one or more databases.
 
 DISCLAIMER:
 This code is not supported under any Microsoft standard support program or service.
@@ -533,134 +543,8 @@ or other pecuniary loss even if it has been advised of the possibility of such d
 Read all the implementation and usage notes thoroughly.
 
 CHANGE LOG:
-v1   	- 08-02-2011 - Initial release
-v1.1 	- 15-02-2011 - Added support for maintaining current index padding options;
-						Added logic for Exception of hypothetical objects;
-						Deal with LOB compaction when reorganizing;
-						Corrected bug with update stats kicking in when not supposed to;
-						Corrected options not compatible with partitioned indexes;
-v1.2 	- 10-03-2011 - Increased control over new or changed database handling;
-v1.2.1 	- 22-03-2011 - Corrected method of finding available processors;
-v1.3    - 21-06-2011 - Added more options to act upon statistics (IX related or Table-wide);
-						Added finer thresholds for updates on table-wide statistics when reorganizing (when SAMPLED or DETAILED scanMode is selected);
-						Added option for no_recompute on index REBUILD;
-						Added restrictions for spatial and XML indexes;
-						Always rebuild filtered indexes;
-						If found, output list of disabled or hypothetical indexes so that you can act on them;
-						Added range scan count to logging table for comparison;
-						Added update index related stats (with defaults) before rebuild operations. This provides better cardinality estimation, and thus a more time-efficient operation when rebuilding;
-						Bug fix in Reorganize statements.
-						Bug fix in one Rescanning condition.
-v1.3.1  - 28-06-2011 - Corrected issue with commands running on multiple partitions.
-						Changed behaviour of update statistics when tables have multiple partitions.
-v1.3.2  - 01-07-2011 - Changed objects named %Exclusions to %Exceptions. When re-deploying, existing %Exclusions table will be renamed and not recreated.
-						Added procedure to check current batch execution progress (usp_CurrentExecStats)
-v1.3.3	- 08-07-2011 - Corrected issue where explicit change in database scope parameter did not trigger rescan under certain conditions.
-						Corrected statistics update thresholds.
-v1.3.4	- 22-07-2011 - Bug fix in indexes information regarding the sql version.
-v1.3.5  - 15-11-2011 - Bug fix in logging showing as NULL on some issued commands.
-						Optimizations on support SP usp_AdaptiveIndexDefrag_Exceptions.
-v1.3.6  - 17-02-2012 - Allow larger object names in tables and indexes.
-v1.3.7	- 27-02-2012 - Enhanced error reporting view to incorporate stats updates;
-						Bug fix when certain index options were chosen together.
-v1.3.8	- 28-02-2012 - Corrected view that reports last run;
-						Added upgrade mode.
-v1.3.9	- 12-03-2012 - Fixed upgrade mode in case old data cannot be copied back.
-v1.4.0	- 12-04-2012 - Fixed issue with collation sensitive servers.
-v1.4.1  - 17-05-2012 - Fixed issue on support SP usp_AdaptiveIndexDefrag_Exceptions.
-v1.4.2  - 29-05-2012 - Fixed issue on support SP usp_AdaptiveIndexDefrag_CurrentExecStats,
-						Fixed issue with large object IDs.
-v1.4.3  - 29-08-2012 - Fixed issue with upgrade mode data retention,
-						Fixed issue with format dependent conversions.
-v1.4.4  - 10-09-2012 - Fixed issue where running the procedure to print commands only, previous execution errors would still be reported.
-v1.4.5  - 12-10-2012 - Added support for ignoring errors regarding database objects that were dropped since the defrag cycle began;
-						Added support for disabling indexes before rebuilding (space saving feature) - see notes below on parameter @disableNCIX.
-v1.4.6  - 23-01-2013 - Added hard limit of 4 for MaxDOP setting;
-						Changed default for statistics update to updates all stats in table, as opposed to just index related stats;
-						Fixed issue on support SP usp_AdaptiveIndexDefrag_CurrentExecStats reporting incorrect number of already defraged indexes;
-						Fixed null elimination message with vw_LastRun_Log;
-						Incremented debug mode output;
-						Redesigned table wide statistics update (updateStatsWhere parameter);
-						Fixed issue with upgrade mode leaving old tables behind.
-v1.4.7  - 28-01-2013 - Fixed issue with exceptions not working with on some days i.e, on a day that should not be doing anything, it did;
-						Tuned online rebuild options;
-						Redesigned support SP usp_AdaptiveIndexDefrag_Exceptions.
-v1.4.9  - 11-04-2013 - Added support for Enterprise Core Edition;
-						Added support for Always On secondary replicas;
-						Changed maxdop hard limit to 8;
-						Added support for sys.dm_db_stats_properties in statistics update, if on SQL 2008R2 SP2 or SQL 2012 SP1 or higher.
-v1.5.0  - 25-04-2013 - Fixed issue with online rebuilds;
-						Fixed issue with commands not being printed when choosing @ExecPrint = 0.
-v1.5.1	- 01-05-2013 - Fixed issue with page locking off and trying index reorganize - should always rebuild;
-						Fixed issue with specific db scope and Always On replica checking;
-						Enhanced stats lookup for specific table scope;
-						Fixed issue where disable index would also do extra update on previous index related statistic;
-						Added support for online rebuild with LOBs in SQL Server 2012.
-v1.5.1.1- 02-05-2013 - Fixed MaxDOP issue introduced in v1.4.9;
-						Fixed issue with DETAILED scan mode;
-						Fixed issue with extended indexes not being picked up.
-v1.5.1.2- 05-05-2013 - Fixed issue with print command while executing introduced in v1.5.1;
-						Fixed issue where a statistics update error would show in the log associated with an XML or Spatial index.
-v1.5.1.4- 10-05-2013 - Fixed issue with statistics update when there is no work to be done, introduced in v1.5.1.
-v1.5.2	- 17-06-2013 - Added option for lock timeout;
-						Set deadlock priority to lowest possible;
-						Simulate TF 2371 behavior on update statistics threshold;
-						Fixed issue with @updateStatsWhere = 1 where not all non-index related statistics were updated.
-v1.5.3  - 02-07-2013  - Fixed issue with updating statistics and XML indexes;
-						Fixed issue with log data being partially overwritten;
-						Fixed issue where using @fillfactor to reset fill factor to default would not actually reset.
-v1.5.3.1- 08-07-2013 - Fixed issue where using @fillfactor to reset fill factor to default would output command error.
-v1.5.4  - 12-09-2013 - Changed system database exclusion choices;
-						Fixed fill factor information not getting logged (thanks go to Chuck Lathrope);
-						All statistics update now included in exception days rule.
-						Changed partition handling to avoid unwarranted scanning and speed up process on tables with many partitions.
-v1.5.5  - 24-10-2013 - Added more verbose to debug mode;
-						Fixed issue with error while keeping original fill factor when it was already set to 0 on the index;
-						Fixed issue with error 35337 or 2706 on update statistics.
-v1.5.6 - 27-11-2013 - Added SQL 2014 support for online partition rebuild;
-						Tuned LOB support with online operations;
-						Improved detection of scope changes - saves unneeded database scans;
-						Optimized defrag cycle pre-work with partially excluded DBs;
-						Fixed issue with skipping partially excluded databases;
-						Added resilience for CS collations.
-v1.5.7 - 14-01-2014 - Fixed issue on support SP usp_AdaptiveIndexDefrag_Exceptions with SQL Server 2005;
-						Fixed issue with support SP usp_AdaptiveIndexDefrag_CurrentExecStats.
-v1.5.8 - 10-05-2014	- Added SQL 2014 support for Online Lock Priority;
-						Fixed issue introduced in previous version where an Online rebuild operation could not be executed in SQL 2012.
-v1.5.9 - 17-11-2014 - Fixed issue on support SP usp_AdaptiveIndexDefrag_PurgeLogs.
-v1.6 - 18-11-2014 - Added resilience when objects are dropped while being scanned, avoiding error 2573.
-v1.6.1 - 04-02-2015 - Removed dependency of @scan_mode to use TF 2371 behavior for statistics update;
-						Improved support for Columnstore indexes on SQL 2014, with specific rebuild threshold and reorg option.
-v1.6.2 - 10/3/2016 - Added option to determine whether to exclude blobs from fragmentation scan;
-						Added support for incremental statistics;
-						Fixed PK issue with columnstore fragmentation discovery.
-						Fixed issue where auto created statistics would not be picked up for update.
-v1.6.3 - 10/14/2016 - Fixed issue with statistics collection in SQL Server 2012 and below;
-						Fixed issue where indexes on views generated error 1934.
-v1.6.3.1 - 10/26/2016 - Fixed failed migration from v1.6.2 with NULL insert error;
-						Fixed issue when running in debug mode.
-v1.6.3.2 - 11/4/2016 - Fixed DISABLE index applying to NCCI.
-						Fixed statistics not being updated before index rebuild - introduced in v1.6.2;
-						Fixed misplaced index disable statement if @Exec_Print = 0;
-						Fixed issue with statistics collection in SQL Server 2012 and below;
-						Added statistic related info to log table (rows, mod counter, rows sampled).
-v1.6.3.3 - 11/7/2016 - Rolled back previously reported issue with REORGANIZE and database names.
-v1.6.4 - 11/10/2016 - Fixed support for incremental statistics in SQL Server 2016 RTM.
-v1.6.4.1 - 11/16/2016 - Added support for incremental statistics in SQL Server 2016 SP1.
-v1.6.4.2 - 1/20/2017 - Fixed support for incremental statistics introduced error 4104.
-v1.6.5 - 2/18/2017 - Fixed empty columnstore indexes being picked up;
-						Fixed orphaned statistic not being updated and preventing rescan;
-						Fixed getting null comparison in sys.indexes (only on SQL 2005, SQL 2008 or SQL 2008R2 pre-SP2);
-						Fixed insert error into tbl_AdaptiveIndexDefrag_Stats_log table.
-v1.6.5.1 - 3/3/2017 - Added custom threshold parameter for percent of changes needed to trigger statistics update, overriding default handling;
-						Added parameter for min rows to be considered with custom threshold parameter.
-v1.6.5.2 - 4/13/2017 - Lowered min threshold for @statsThreshold setting.
-v1.6.5.3 - 4/30/2017 - Fixed error in debug summary.
-v1.6.5.4 - 8/04/2017 - Fixed error where @minPageCount wasn't getting passed into @ColumnStoreGetIXSQL (by hitzand)
-v1.6.5.5 - 8/11/2017 - Added support for fixed sampling rate for statistics.
-v1.6.5.6 - 10/16/2017 - Added logging for fragmentation analysis.
-v1.6.5.7 - 10/19/2017 - Extended support for CCI under SQL 2016 and above.
-					
+See https://github.com/microsoft/tigertoolbox/blob/master/AdaptiveIndexDefrag/CHANGELOG.txt
+
 IMPORTANT:
 Execute in the database context of where you created the log and working tables.			
 										
@@ -705,15 +589,16 @@ ALL parameters are optional. If not specified, the defaults for each parameter a
 					0 = only Non-Clustered indexes will be defragmented (includes XML and Spatial Indexes);
 
 @minFragmentation 	Defaults to 5%, will not defrag if fragmentation is less.
-					Refer to http://msdn.microsoft.com/en-us/library/ms189858.aspx
+					Refer to http://docs.microsoft.com/sql/relational-databases/indexes/reorganize-and-rebuild-indexes
 
 @rebuildThreshold 	Defaults to 30%. greater than 30% will result in rebuild instead of reorganize.
-					Refer to http://msdn.microsoft.com/en-us/library/ms189858.aspx
+					Refer to http://docs.microsoft.com/sql/relational-databases/indexes/reorganize-and-rebuild-indexes
 										
 @rebuildThreshold_csDefaults to 10%. Greater than 10% will result in columnstore rebuild.
-					Refer to https://msdn.microsoft.com/en-us/data/dn589807(v=sql.120)
+					Refer to http://docs.microsoft.com/sql/relational-databases/sql-server-index-design-guide
 										
-@minPageCount 		Specifies how many pages must exist in an index in order to be considered for a defrag. Default to an extent. Refer to http://msdn.microsoft.com/en-us/library/ms189858.aspx
+@minPageCount 		Specifies how many pages must exist in an index in order to be considered for a defrag. Default to an extent. 
+					Refer to http://docs.microsoft.com/sql/relational-databases/indexes/reorganize-and-rebuild-indexes
 					NOTE: The @minPageCount will restrict the indexes that are stored in tbl_AdaptiveIndexDefrag_Working table and can render other options inoperative.
 
 @maxPageCount 		Specifies the maximum number of pages that can exist in an index and still be considered for a defrag.
@@ -738,16 +623,16 @@ ALL parameters are optional. If not specified, the defaults for each parameter a
 @sortInTempDB 		When 1, the sort results are stored in TempDB. When 0, the sort results are stored in the filegroup or partition scheme in which the resulting index is stored.
 					If a sort operation is not required, or if the sort can be performed in memory, SORT_IN_TEMPDB is ignored.
 					Enabling this option can result in faster defrags and prevent database file size inflation.	Just have monitor TempDB closely.
-					More information here: http://msdn.microsoft.com/en-us/library/ms188281.aspx and http://msdn.microsoft.com/en-us/library/ms179542.aspx and http://msdn.microsoft.com/en-us/library/ms191183.aspx
+					Refer to http://docs.microsoft.com/sql/relational-databases/indexes/sort-in-tempdb-option-for-indexes and http://docs.microsoft.com/sql/relational-databases/indexes/disk-space-requirements-for-index-ddl-operations and http://docs.microsoft.com/sql/relational-databases/indexes/disk-space-requirements-for-index-ddl-operations
 					1 = perform sort operation in TempDB
 					0 = perform sort operation in the indexes database
 
-@maxDopRestriction 	Option to specify a processor limit for index rebuilds
+@maxDopRestriction 	Option to specify a processor limit for index rebuilds and statistics updates. If not specified, defrag operations will use the system MaxDOP setting, up to a limit of 8.
 					
 @updateStats		1 = updates stats when reorganizing;
 					0 = does not update stats when reorganizing	
 					
-@updateStatsWhere	Update statistics within certain thresholds (http://support.microsoft.com/kb/195565/en-us)
+@updateStatsWhere	Update statistics within certain thresholds. Refer to http://docs.microsoft.com/sql/relational-databases/statistics/statistics
 					1 = updates only index related stats;
 					0 = updates all stats in entire table
 										
@@ -774,7 +659,8 @@ ALL parameters are optional. If not specified, the defaults for each parameter a
 					0 = default which is with STATISTICS_NORECOMPUTE off
 					
 @statsIncremental	When Incremental is ON, the statistics created are per partition statistics. 
-					When OFF, the statistics tree is dropped and SQL Server re-computes the statistics. This setting overrides the database level INCREMENTAL property. (http://msdn.microsoft.com/en-us/library/ms190397.aspx)
+					When OFF, the statistics tree is dropped and SQL Server re-computes the statistics. This setting overrides the database level INCREMENTAL property. 
+					Refer to http://docs.microsoft.com/sql/relational-databases/statistics/statistics
 					NULL = Keep server setting;
 					1 = Enable auto create statistics with Incremental
 					0 = Disable auto create statistics with Incremental
@@ -808,7 +694,8 @@ ALL parameters are optional. If not specified, the defaults for each parameter a
 					0 = does NOT disable non-clustered indexes prior to a rebuild (default behavior);
 					1 = disables non-clustered indexes prior to a rebuild (space saving feature)
 
-@offlinelocktimeout	As set in SET LOCK_TIMEOUT (http://msdn.microsoft.com/en-us/library/ms189470.aspx)
+@offlinelocktimeout	As set in SET LOCK_TIMEOUT option
+					Refer to http://docs.microsoft.com/sql/t-sql/statements/set-lock-timeout-transact-sql
 					-1 = (default) indicates no time-out period
 					Any other positive integer = sets the number of milliseconds that will pass before Microsoft SQL Server returns a locking error
 
@@ -826,6 +713,12 @@ ALL parameters are optional. If not specified, the defaults for each parameter a
 @getBlobfrag		Indicates whether to exclude or include blobs from fragmentation scan.
 					0 = (default) exclude blobs from fragmentation scan.
 					1 = include blobs and off-row data when scanning for fragmentation.
+					
+@dataCompression 	Sets specific compression options for all indexes. 
+					NULL = (default) Does not use the DATA_COMPRESSION keyword in index rebuild, keeping whatever compression setting exists.
+					NONE = Index or specified partitions are not compressed.
+					PAGE = Use page compression.
+					ROW = Use row compression.
 				
 -------------------------------------------------------		
 Usage:
@@ -858,7 +751,7 @@ SET XACT_ABORT ON;
 SET QUOTED_IDENTIFIER ON;
 SET DATEFORMAT ymd;
 SET DEADLOCK_PRIORITY -10;
--- Required so it can update stats on IxVws and FiltIxs
+-- Required so it can update stats on Indexed Views and Filtered Indexes
 SET ANSI_WARNINGS ON;
 SET ANSI_PADDING ON;
 SET ANSI_NULLS ON;
@@ -866,11 +759,12 @@ SET ARITHABORT ON;
 SET CONCAT_NULL_YIELDS_NULL ON;
 SET NUMERIC_ROUNDABORT OFF;
 
-/* Find sql server version info */
-DECLARE @sqlmajorver int, @sqlminorver int, @sqlbuild int;
+/* Find sql server version and edition info */
+DECLARE @sqlmajorver int, @sqlminorver int, @sqlbuild int, @engineedition int;
 SELECT @sqlmajorver = CONVERT(int, (@@microsoftversion / 0x1000000) & 0xff);
 SELECT @sqlminorver = CONVERT(int, (@@microsoftversion / 0x10000) & 0xff);
 SELECT @sqlbuild = CONVERT(int, @@microsoftversion & 0xffff);
+SELECT @engineedition = CONVERT(int, SERVERPROPERTY('EngineEdition'));
 
 BEGIN
 	BEGIN TRY		
@@ -893,6 +787,9 @@ BEGIN
 
 		IF @timeLimit IS NULL
 		SET @timeLimit = 480;
+		
+		IF @dataCompression IS NOT NULL AND UPPER(@dataCompression) NOT IN ('NONE','ROW','PAGE')
+		SET @dataCompression = NULL;
 
 		/* Validate if table name is fully qualified and database scope is set */
 		IF @tblName IS NOT NULL AND @tblName NOT LIKE '%.%'
@@ -976,7 +873,7 @@ BEGIN
 		SET @persistStatsSample = NULL;
 
 		/* Recognize if database in scope is a Always On secondary replica */
-		IF @dbScope IS NOT NULL AND @sqlmajorver >= 11
+		IF @dbScope IS NOT NULL AND @sqlmajorver >= 11 AND @engineedition NOT IN (5, 6) -- Except SQL Database and SQL DW
 		BEGIN
 			DECLARE @sqlcmdAO NVARCHAR(3000), @paramsAO NVARCHAR(50), @DBinAG int
 			SET @sqlcmdAO = 'IF LOWER(@dbScopeIN) IN (SELECT LOWER(DB_NAME(dr.database_id))
@@ -1003,11 +900,12 @@ END'
 				RETURN
 			END
 		END
-			/* Check if database scope has changed, if rescan is not being forced */
+			
+		/* Check if database scope has changed, if rescan is not being forced */
 		IF @forceRescan = 0 AND @dbScope IS NOT NULL -- Specific scope was set
 		BEGIN
-			IF (SELECT COUNT(DISTINCT [dbID]) FROM dbo.tbl_AdaptiveIndexDefrag_Working) = 1
-				AND QUOTENAME(LOWER(@dbScope)) NOT IN (SELECT DISTINCT LOWER([dbName]) FROM dbo.tbl_AdaptiveIndexDefrag_Working UNION SELECT DISTINCT LOWER(dbName) FROM dbo.tbl_AdaptiveIndexDefrag_Stats_Working)
+			IF (SELECT COUNT(DISTINCT [dbID]) FROM dbo.tbl_AdaptiveIndexDefrag_Working) > 1
+				OR QUOTENAME(LOWER(@dbScope)) NOT IN (SELECT DISTINCT LOWER([dbName]) FROM dbo.tbl_AdaptiveIndexDefrag_Working UNION SELECT DISTINCT LOWER(dbName) FROM dbo.tbl_AdaptiveIndexDefrag_Stats_Working)
 			BEGIN
 				SET @forceRescan = 1
 				RAISERROR('Scope has changed. Forcing rescan of single database in scope...', 0, 42) WITH NOWAIT;
@@ -1026,6 +924,15 @@ END'
 			RAISERROR('No indexes of the chosen type left to defrag nor statistics left to update. Forcing rescan...', 0, 42) WITH NOWAIT;
 		END;
 		
+		/* Recognize if we missing information post-upgrade;
+			if so force rescan of database(s) */
+		IF @forceRescan = 0
+			AND (EXISTS (SELECT TOP 1 * FROM dbo.tbl_AdaptiveIndexDefrag_Working 
+			WHERE (fill_factor IS NULL OR is_padded IS NULL OR compression_type IS NULL) AND [exclusionMask] & POWER(2, DATEPART(weekday, GETDATE())-1) = 0))		BEGIN
+			SET @forceRescan = 1
+			RAISERROR('Missing column information due to post-upgrade condition. Forcing rescan...', 0, 42) WITH NOWAIT;
+		END;
+		
 		/* Check if any databases where dropped or created since last run, if rescan is not being forced */		
 		IF @forceRescan = 0 AND @dbScope IS NULL
 		BEGIN
@@ -1040,7 +947,7 @@ UNION
 SELECT DISTINCT [dbID] FROM [' + DB_NAME() + '].dbo.tbl_AdaptiveIndexDefrag_Stats_Working
 UNION
 SELECT DISTINCT [dbID] FROM [' + DB_NAME() + '].dbo.tbl_AdaptiveIndexDefrag_Exceptions
-WHERE [dbID] IN (SELECT DISTINCT database_id FROM master.sys.databases sd
+WHERE [dbID] IN (SELECT DISTINCT database_id FROM sys.databases sd
 	WHERE LOWER(sd.[name]) NOT IN (''master'', ''tempdb'', ''model'', ''reportservertempdb'',''semanticsdb'')
 		AND [state] = 0 -- must be ONLINE
 		AND is_read_only = 0 -- cannot be READ_ONLY
@@ -1058,16 +965,17 @@ WHERE [dbID] IN (SELECT DISTINCT database_id FROM master.sys.databases sd
 				, hasIXs bit NOT NULL
 				, scanStatus bit NULL
 			);
-				/* Retrieve the list of databases to loop, excluding Always On secondary replicas */	
+			
+			/* Retrieve the list of databases to loop, excluding Always On secondary replicas */	
 			SET @sqlcmd_CntTgt = 'SELECT [database_id], 0, 0 -- not yet scanned
-FROM master.sys.databases
+FROM sys.databases
 WHERE LOWER([name]) = ISNULL(LOWER(@dbScopeIN), LOWER([name]))	
 	AND LOWER([name]) NOT IN (''master'', ''tempdb'', ''model'', ''reportservertempdb'',''semanticsdb'') -- exclude system databases
 	AND [state] = 0 -- must be ONLINE
 	AND is_read_only = 0 -- cannot be READ_ONLY
 	AND is_distributor = 0'
 				
-			IF @sqlmajorver >= 11 -- Except all local Always On secondary replicas
+			IF @sqlmajorver >= 11 AND (SELECT @@VERSION) NOT LIKE 'Microsoft SQL Azure%' -- Except all local Always On secondary replicas
 			BEGIN
 				SET @sqlcmd_CntTgt = @sqlcmd_CntTgt + CHAR(10) + 'AND [database_id] NOT IN (SELECT dr.database_id FROM sys.dm_hadr_database_replica_states dr
 INNER JOIN sys.dm_hadr_availability_replica_states rs ON dr.group_id = rs.group_id
@@ -1161,7 +1069,7 @@ BEGIN SET @hasIXsOUT = 1 END ELSE BEGIN SET @hasIXsOUT = 0 END'
 				, @partitionSQL_Param NVARCHAR(1000)
 				, @rowmodctrSQL NVARCHAR(4000)
 				, @rowmodctrSQL_Param NVARCHAR(1000)
-				, @rowmodctr bigint
+				, @rowmodctr NUMERIC(10,3)
 				, @record_count bigint
 				, @range_scan_count bigint
 				, @getStatSQL NVARCHAR(4000)
@@ -1194,9 +1102,11 @@ BEGIN SET @hasIXsOUT = 1 END ELSE BEGIN SET @hasIXsOUT = 0 END'
 				, @ColumnStoreGetIXSQL_Param NVARCHAR(1000)
 				, @rows bigint
 				, @rows_sampled bigint
+				, @AID_dbID int
+				, @currCompression NVARCHAR(60)
 
 		/* Initialize variables */	
-		SELECT @startDateTime = GETDATE(), @endDateTime = DATEADD(minute, @timeLimit, GETDATE()), @operationFlag = NULL, @ver = '1.6.5.6';
+		SELECT @AID_dbID = DB_ID(), @startDateTime = GETDATE(), @endDateTime = DATEADD(minute, @timeLimit, GETDATE()), @operationFlag = NULL, @ver = '1.6.6.9';
 	
 		/* Create temporary tables */	
 		IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tblIndexDefragDatabaseList'))
@@ -1246,7 +1156,7 @@ BEGIN SET @hasIXsOUT = 1 END ELSE BEGIN SET @hasIXsOUT = 0 END'
 			SET @maxDopRestriction = 8;
 		END
 
-		/* Refer to http://msdn.microsoft.com/en-us/library/ms174396.aspx */	
+		/* Refer to http://docs.microsoft.com/sql/t-sql/functions/serverproperty-transact-sql */	
 		IF (SELECT SERVERPROPERTY('EditionID')) IN (1804890536, 1872460670, 610778273, -2117995310)	
 		SET @editionCheck = 1 -- supports enterprise only features: online rebuilds, partitioned indexes and MaxDOP
 		ELSE	
@@ -1255,7 +1165,7 @@ BEGIN SET @hasIXsOUT = 1 END ELSE BEGIN SET @hasIXsOUT = 0 END'
 		/* Output the parameters to work with */	
 		IF @debugMode = 1	
 		BEGIN	
-			SELECT @debugMessage = CHAR(10) + 'Executing AdaptiveIndexDefrag v' + @ver + ' on ' + @@VERSION + '.
+			SELECT @debugMessage = CHAR(10) + 'Executing AdaptiveIndexDefrag v' + @ver + ' on ' + @@VERSION + '
 The selected parameters are:
 Defragment indexes with fragmentation greater or equal to ' + CAST(@minFragmentation AS NVARCHAR(10)) + ';
 Rebuild indexes with fragmentation greater than ' + CAST(@rebuildThreshold AS NVARCHAR(10)) + ';
@@ -1265,7 +1175,7 @@ Rebuild columnstore indexes with fragmentation greater than ' + CAST(@rebuildThr
 Commands' + CASE WHEN @Exec_Print = 1 THEN ' WILL' ELSE ' WILL NOT' END + ' be executed automatically;
 Defragment indexes in ' + @defragSortOrder + ' order of the ' + UPPER(@defragOrderColumn) + ' value;
 Time limit' + CASE WHEN @timeLimit IS NULL THEN ' was not specified;' ELSE ' was specified and is '	+ CAST(@timeLimit AS NVARCHAR(10)) END + ' minutes;
-' + CASE WHEN @dbScope IS NULL THEN 'ALL databases' ELSE 'The ' + @dbScope + ' database' END + ' will be defragmented;
+' + CASE WHEN @dbScope IS NULL THEN 'ALL databases' ELSE 'The [' + @dbScope + '] database' END + ' will be defragmented;
 ' + CASE WHEN @tblName IS NULL THEN 'ALL tables' ELSE 'The ' + @tblName + ' table' END + ' will be defragmented;
 ' + 'We' + CASE WHEN EXISTS(SELECT TOP 1 * FROM dbo.tbl_AdaptiveIndexDefrag_Working WHERE defragDate IS NULL) AND @forceRescan = 0 THEN ' will resume any existing previous run. If so, we WILL NOT' ELSE ' WILL' END + ' be rescanning indexes;
 The scan will be performed in ' + @scanMode + ' mode;
@@ -1274,7 +1184,8 @@ Limit defrags to indexes' + CASE WHEN @maxPageCount IS NULL THEN ' with more tha
 ' between ' + CAST(@minPageCount AS NVARCHAR(10)) + ' and ' + CAST(@maxPageCount AS NVARCHAR(10)) END + ' pages;
 Indexes will be defragmented' + CASE WHEN @onlineRebuild = 0 OR @editionCheck = 0 THEN ' OFFLINE;' ELSE ' ONLINE;' END + '
 Indexes will be sorted in' + CASE WHEN @sortInTempDB = 0 THEN ' the DATABASE;' ELSE ' TEMPDB;' END + '
-Indexes will have' + CASE WHEN @fillfactor = 1 THEN ' its ORIGINAL' ELSE ' the DEFAULT' END + ' Fill Factor;' +
+Indexes will use ' + CASE WHEN @dataCompression IS NULL THEN 'CURRENT compression setting;' WHEN @dataCompression = 'NONE' THEN 'NO compression on all indexes;' WHEN @dataCompression = 'PAGE' THEN 'PAGE compression on all indexes;' WHEN @dataCompression = 'ROW' THEN 'ROW compression on all indexes;' ELSE @dataCompression + 'COLUMNSTORE compression on all indexes;' END + '
+Indexes will keep' + CASE WHEN @fillfactor = 1 THEN ' its EXISTING' ELSE ' the DEFAULT' END + ' Fill Factor;' +
 CASE WHEN @dealMaxPartition = 1 AND @editionCheck = 1 THEN '
 The right-most populated partitions will be ignored;'
 WHEN @dealMaxPartition = 0 AND @editionCheck = 1 THEN '		
@@ -1289,10 +1200,10 @@ CHAR(10) + 'Statistics will be updated using ' + CASE WHEN @statsThreshold IS NO
 + ' on tables' + CASE WHEN @statsThreshold IS NOT NULL AND @statsThreshold BETWEEN 0.01 AND 100.0 AND @statsMinRows IS NOT NULL THEN ' with a min of ' + CONVERT(VARCHAR, @statsMinRows) + ' rows.' WHEN @statsMinRows IS NOT NULL THEN ' of any size.' ELSE '.' END + 		
 CHAR(10) + 'Statistics will be updated with Incremental property (if any) ' + CASE WHEN @statsIncremental = 1 THEN 'as ON' WHEN @statsIncremental = 0 THEN 'as OFF' ELSE 'not changed from current setting' END + '.' +
 CHAR(10) + 'Defragmentation will use ' + CASE WHEN @editionCheck = 0 OR @maxDopRestriction IS NULL THEN 'system defaults for processors;'
-ELSE CAST(@maxDopRestriction AS VARCHAR(2)) + ' processors;' END +
+ELSE CAST(@maxDopRestriction AS VARCHAR(3)) + ' processors;' END +
 CHAR(10) + 'Lock timeout is set to ' + CASE WHEN @offlinelocktimeout <> -1 AND @offlinelocktimeout IS NOT NULL THEN CONVERT(NVARCHAR(15), @offlinelocktimeout) ELSE 'system default' END + ' for offline rebuilds;' +
-CHAR(10) + 'From SQL Server 2014, lock timeout is set to ' + CONVERT(NVARCHAR(15), @onlinelocktimeout) + ' for online rebuilds;' +
-CHAR(10) + 'From SQL Server 2014, lock timeout action is set to ' + CASE WHEN @abortAfterwait = 0 THEN 'BLOCKERS' WHEN @abortAfterwait = 1 THEN 'SELF' ELSE 'NONE' END + ' for online rebuilds;' +
+CHAR(10) + 'Starting with SQL Server 2014, lock timeout is set to ' + CONVERT(NVARCHAR(15), @onlinelocktimeout) + ' for online rebuilds;' +
+CHAR(10) + 'Starting with SQL Server 2014, lock timeout action is set to ' + CASE WHEN @abortAfterwait = 0 THEN 'BLOCKERS' WHEN @abortAfterwait = 1 THEN 'SELF' ELSE 'NONE' END + ' for online rebuilds;' +
 CHAR(10) + CASE WHEN @printCmds = 1 THEN ' DO print' ELSE ' DO NOT print' END + ' the sql commands;' +
 CHAR(10) + CASE WHEN @outputResults = 1 THEN ' DO output' ELSE ' DO NOT output' END + ' fragmentation levels;
 Wait ' + @defragDelay + ' (hh:mm:ss) between index operations;
@@ -1307,7 +1218,7 @@ Execute in' + CASE WHEN @debugMode = 1 THEN ' DEBUG' ELSE ' SILENT' END + ' mode
 			IF @debugMode = 1
 			RAISERROR('Listing databases...', 0, 42) WITH NOWAIT;
 
-			/* Retrieve the list of databases to loop, exclusing Always On secondary replicas */	
+			/* Retrieve the list of databases to loop, excluding Always On secondary replicas */	
 			DECLARE @sqlcmdAO2 NVARCHAR(4000), @paramsAO2 NVARCHAR(50)
 			
 			IF @debugMode = 1 AND @sqlmajorver >= 11
@@ -1317,14 +1228,14 @@ Execute in' + CASE WHEN @debugMode = 1 THEN ' DEBUG' ELSE ' SILENT' END + ' mode
 			RAISERROR('Retrieving list of databases to loop...', 0, 42) WITH NOWAIT;
 
 			SET @sqlcmdAO2 = 'SELECT [database_id], name, 0 -- not yet scanned for fragmentation
-FROM master.sys.databases
+FROM sys.databases
 WHERE LOWER([name]) = ISNULL(LOWER(@dbScopeIN), LOWER([name]))	
 	AND LOWER([name]) NOT IN (''master'', ''tempdb'', ''model'', ''reportservertempdb'',''semanticsdb'') -- exclude system databases
 	AND [state] = 0 -- must be ONLINE
 	AND is_read_only = 0 -- cannot be READ_ONLY
 	AND is_distributor = 0'
 				
-			IF @sqlmajorver >= 11 -- Except all local Always On secondary replicas
+			IF @sqlmajorver >= 11 AND (SELECT @@VERSION) NOT LIKE 'Microsoft SQL Azure%'-- Except all local Always On secondary replicas
 			BEGIN
 				SET @sqlcmdAO2 = @sqlcmdAO2 + CHAR(10) + 'AND [database_id] NOT IN (SELECT dr.database_id FROM sys.dm_hadr_database_replica_states dr
 INNER JOIN sys.dm_hadr_availability_replica_states rs ON dr.group_id = rs.group_id
@@ -1397,11 +1308,19 @@ WHERE so.is_ms_shipped = 0 AND si.index_id > 0 AND si.is_hypothetical = 0
 			/* Reset status after cross check with exceptions */
 			UPDATE #tblIndexDefragDatabaseList
 			SET scanStatus = 0;
+			
+			/* Delete database set by @dbScope */
+			IF @dbScope IS NOT NULL
+			BEGIN
+				DELETE FROM #tblIndexDefragDatabaseList
+				WHERE dbID <> DB_ID(@dbScope);
+			END;
 		END
 
 		/* Check to see if we have indexes of the chosen type in need of defrag, or stats to update; otherwise, allow re-scanning the database(s) */
-		IF @forceRescan = 1 OR (NOT EXISTS (SELECT TOP 1 * FROM dbo.tbl_AdaptiveIndexDefrag_Working WHERE defragDate IS NULL AND [exclusionMask] & POWER(2, DATEPART(weekday, GETDATE())-1) = 0)
-									AND NOT EXISTS (SELECT TOP 1 * FROM dbo.tbl_AdaptiveIndexDefrag_Stats_Working AS idss WHERE idss.updateDate IS NULL AND NOT EXISTS (SELECT TOP 1 objectID FROM dbo.tbl_AdaptiveIndexDefrag_Working ids WHERE ids.[dbID] = idss.[dbID] AND ids.objectID = idss.objectID AND idss.statsName = ids.indexName AND idss.updateDate IS NULL AND ids.exclusionMask & POWER(2, DATEPART(weekday, GETDATE())-1) = 0)))
+		IF @forceRescan = 1 OR (@forceRescan = 0 
+			AND NOT EXISTS (SELECT TOP 1 * FROM dbo.tbl_AdaptiveIndexDefrag_Working WHERE defragDate IS NULL AND [exclusionMask] & POWER(2, DATEPART(weekday, GETDATE())-1) = 0)
+			AND NOT EXISTS (SELECT TOP 1 * FROM dbo.tbl_AdaptiveIndexDefrag_Stats_Working AS idss WHERE idss.updateDate IS NULL AND NOT EXISTS (SELECT TOP 1 objectID FROM dbo.tbl_AdaptiveIndexDefrag_Working ids WHERE ids.[dbID] = idss.[dbID] AND ids.objectID = idss.objectID AND idss.statsName = ids.indexName AND idss.updateDate IS NULL AND ids.exclusionMask & POWER(2, DATEPART(weekday, GETDATE())-1) = 0)))
 		BEGIN	
 			IF @debugMode = 1
 			RAISERROR('Preparing for new database scan...', 0, 42) WITH NOWAIT;
@@ -1412,7 +1331,7 @@ WHERE so.is_ms_shipped = 0 AND si.index_id > 0 AND si.is_hypothetical = 0
 		END
 		ELSE
 		BEGIN
-			/* Print an error message if there are any indexes left to defragment according to the chosen criteria */		
+			/* Print an error message if there are any indexes left to defrag according to the chosen criteria */		
 			IF @debugMode = 1		
 			RAISERROR('There are still fragmented indexes or out-of-date stats from last execution. Resuming...', 0, 42) WITH NOWAIT;
 		END
@@ -1432,7 +1351,7 @@ WHERE so.is_ms_shipped = 0 AND si.index_id > 0 AND si.is_hypothetical = 0
 				SELECT TOP 1 @dbID = dbID FROM #tblIndexDefragDatabaseList WHERE scanStatus = 0;
 				
 				IF @debugMode = 1
-				SELECT @debugMessage = '  Working on ' + DB_NAME(@dbID) + '...';
+				SELECT @debugMessage = '  Working on database [' + DB_NAME(@dbID) + ']...';
 
 				IF @debugMode = 1		
 				RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
@@ -1449,12 +1368,13 @@ WHERE so.is_ms_shipped = 0 AND si.index_id > 0 AND si.is_hypothetical = 0
 				
 				IF @debugMode = 1
 				RAISERROR('   Building list of objects in database...', 0, 42) WITH NOWAIT;
-				SELECT @TableScanSQL = 'SELECT si.[object_id], si.index_id, si.type, sp.partition_number, 0
-FROM [' + DB_NAME(@dbID) + '].sys.indexes si
-INNER JOIN [' + DB_NAME(@dbID) + '].sys.partitions sp ON si.[object_id] = sp.[object_id] AND si.index_id = sp.index_id
-INNER JOIN [' + DB_NAME(@dbID) + '].sys.tables AS mst ON mst.[object_id] = si.[object_id]
-INNER JOIN [' + DB_NAME(@dbID) + '].sys.schemas AS t ON t.[schema_id] = mst.[schema_id]' +
-CASE WHEN @dbScope IS NULL AND @tblName IS NULL THEN CHAR(10) + 'LEFT JOIN [' + DB_NAME() + '].dbo.tbl_AdaptiveIndexDefrag_Exceptions AS ide ON ide.[dbID] = ' + CONVERT(NVARCHAR(10),@dbID) + ' AND ide.objectID = si.[object_id] AND ide.indexID = si.index_id' ELSE '' END +
+				SELECT @TableScanSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE [' + DB_NAME(@dbID) + '];
+' ELSE '' END + 'SELECT si.[object_id], si.index_id, si.type, sp.partition_number, 0
+FROM sys.indexes si
+INNER JOIN sys.partitions sp ON si.[object_id] = sp.[object_id] AND si.index_id = sp.index_id
+INNER JOIN sys.tables AS mst ON mst.[object_id] = si.[object_id]
+INNER JOIN sys.schemas AS t ON t.[schema_id] = mst.[schema_id]' +
+CASE WHEN @dbScope IS NULL AND @tblName IS NULL THEN CHAR(10) + 'LEFT JOIN [' + DB_NAME(@AID_dbID) + '].dbo.tbl_AdaptiveIndexDefrag_Exceptions AS ide ON ide.[dbID] = ' + CONVERT(NVARCHAR(10),@dbID) + ' AND ide.objectID = si.[object_id] AND ide.indexID = si.index_id' ELSE '' END +
 CHAR(10) + 'WHERE mst.is_ms_shipped = 0 ' + CASE WHEN @dbScope IS NULL AND @tblName IS NULL THEN 'AND (ide.exclusionMask & POWER(2, DATEPART(weekday, GETDATE())-1) = 0 OR ide.exclusionMask IS NULL)' ELSE '' END + '
 	AND si.[object_id] NOT IN (SELECT sit.[object_id] FROM [' + DB_NAME(@dbID) + '].sys.internal_tables AS sit)' +
 		CASE WHEN @dbScope IS NOT NULL AND @tblName IS NOT NULL THEN '
@@ -1497,7 +1417,7 @@ CHAR(10) + 'WHERE mst.is_ms_shipped = 0 ' + CASE WHEN @dbScope IS NULL AND @tblN
 					INNER JOIN #tblIndexDefragmaxPartitionList AS mpl ON ids.objectID = mpl.objectID AND ids.indexID = mpl.indexID AND ids.partitionNumber <> mpl.maxPartition;
 				END;
 				
-				/* Determine which indexes to defragment using user-defined parameters */
+				/* Determine which indexes to defrag using user-defined parameters */
 				IF @debugMode = 1
 				RAISERROR('      Filtering indexes according to ixtypeOption parameter...', 0, 42) WITH NOWAIT;
 				IF @ixtypeOption IS NULL
@@ -1526,6 +1446,12 @@ CHAR(10) + 'WHERE mst.is_ms_shipped = 0 ' + CASE WHEN @dbScope IS NULL AND @tblN
 					
 					/* Get the time for logging purposes */		
 					SET @dateTimeStart = GETDATE();
+
+					IF @debugMode = 1
+					BEGIN
+						SELECT @debugMessage = '      Analyzing index ID ' + CONVERT(VARCHAR(20), @indexID) + ' on table [' + OBJECT_NAME(@objectID, @dbID) + ']...'
+						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
+					END
 
 					/* Start log actions */
 					INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Analysis_log ([Operation], [dbID], dbName, objectID, objectName, index_or_stat_ID, partitionNumber, dateTimeStart)		
@@ -1563,7 +1489,7 @@ CHAR(10) + 'WHERE mst.is_ms_shipped = 0 ' + CASE WHEN @dbScope IS NULL AND @tblN
 					BEGIN CATCH						
 						IF @debugMode = 1
 						BEGIN
-							SET @debugMessage = '     Error ' + CONVERT(NVARCHAR(20),ERROR_NUMBER()) + ' has occurred while determining which rowstore indexes to defragment. Message: ' + ERROR_MESSAGE() + ' (Line Number: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')'
+							SET @debugMessage = '     Error ' + CONVERT(NVARCHAR(20),ERROR_NUMBER()) + ' has occurred while determining which rowstore indexes to defrag. Message: ' + ERROR_MESSAGE() + ' (Line Number: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')'
 
 							SET @dateTimeEnd = GETDATE();
 
@@ -1609,7 +1535,8 @@ CHAR(10) + 'WHERE mst.is_ms_shipped = 0 ' + CASE WHEN @dbScope IS NULL AND @tblN
 						SET @analysis_id = SCOPE_IDENTITY();
 					
 						BEGIN TRY
-							SELECT @ColumnStoreGetIXSQL = 'USE [' + DB_NAME(@dbID) + ']; SELECT @dbID_In, DB_NAME(@dbID_In), rg.object_id, rg.index_id, rg.partition_number, SUM((ISNULL(rg.deleted_rows,1)*100)/rg.total_rows) AS [fragmentation], SUM(ISNULL(rg.size_in_bytes,1)/1024/8) AS [simulated_page_count], SUM(rg.total_rows) AS total_rows, GETDATE() AS [scanDate]	
+							SELECT @ColumnStoreGetIXSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE [' + DB_NAME(@dbID) + '];
+' ELSE '' END + 'SELECT @dbID_In, QUOTENAME(DB_NAME(@dbID_In)), rg.object_id, rg.index_id, rg.partition_number, CASE WHEN SUM((ISNULL(rg.deleted_rows,1)*100)/rg.total_rows) > 100 THEN 100 ELSE SUM((ISNULL(rg.deleted_rows,1)*100)/rg.total_rows) END AS [fragmentation], SUM(ISNULL(rg.size_in_bytes,1)/1024/8) AS [simulated_page_count], SUM(rg.total_rows) AS total_rows, GETDATE() AS [scanDate]	
 FROM ' + CASE WHEN @sqlmajorver = 12 THEN 'sys.column_store_row_groups' ELSE 'sys.dm_db_column_store_row_group_physical_stats' END + ' rg WITH (NOLOCK)
 WHERE rg.object_id = @objectID_In
 	AND rg.index_id = @indexID_In
@@ -1626,7 +1553,7 @@ OPTION (MAXDOP 2)'
 						BEGIN CATCH						
 							IF @debugMode = 1
 							BEGIN
-								SET @debugMessage = '     Error ' + CONVERT(NVARCHAR(20),ERROR_NUMBER()) + ' has occurred while determining which columnstore indexes to defragment. Message: ' + ERROR_MESSAGE() + ' (Line Number: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')'
+								SET @debugMessage = '     Error ' + CONVERT(NVARCHAR(20),ERROR_NUMBER()) + ' has occurred while determining which columnstore indexes to defrag. Message: ' + ERROR_MESSAGE() + ' (Line Number: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')'
 
 								SET @dateTimeEnd = GETDATE();
 															
@@ -1652,14 +1579,11 @@ OPTION (MAXDOP 2)'
 						WHERE objectID = @objectID AND indexID = @indexID AND partitionNumber = @partitionNumber
 					END
 				END;
-				
-				IF @debugMode = 1
-				RAISERROR('    Looking up additional index information...', 0, 42) WITH NOWAIT;
 
 				/* Look up index status for various purposes */	
 				SELECT @updateSQL = N'UPDATE ids		
 SET schemaName = QUOTENAME(s.name), objectName = QUOTENAME(o.name), indexName = QUOTENAME(i.name), is_primary_key = i.is_primary_key, fill_factor = i.fill_factor, is_disabled = i.is_disabled, is_padded = i.is_padded, is_hypothetical = i.is_hypothetical, has_filter = ' + CASE WHEN @sqlmajorver >= 10 THEN 'i.has_filter' ELSE '0' END + ', allow_page_locks = i.allow_page_locks, type = i.type
-FROM [' + DB_NAME() + '].dbo.tbl_AdaptiveIndexDefrag_Working ids WITH (NOLOCK)
+FROM [' + DB_NAME(@AID_dbID) + '].dbo.tbl_AdaptiveIndexDefrag_Working ids WITH (NOLOCK)
 INNER JOIN [' + DB_NAME(@dbID) + '].sys.objects AS o WITH (NOLOCK) ON ids.objectID = o.object_id
 INNER JOIN [' + DB_NAME(@dbID) + '].sys.indexes AS i WITH (NOLOCK) ON o.object_id = i.object_id AND ids.indexID = i.index_id
 INNER JOIN [' + DB_NAME(@dbID) + '].sys.schemas AS s WITH (NOLOCK) ON o.schema_id = s.schema_id
@@ -1667,57 +1591,64 @@ WHERE o.object_id = ids.objectID AND i.index_id = ids.indexID AND i.type > 0
 AND o.object_id NOT IN (SELECT sit.object_id FROM [' + DB_NAME(@dbID) + '].sys.internal_tables AS sit)
 AND ids.[dbID] = ' + CAST(@dbID AS NVARCHAR(10));
 
-				EXECUTE sp_executesql @updateSQL;
-				
-				IF @scanMode = 'LIMITED'
+				IF @debugMode = 1
 				BEGIN
-					SELECT @updateSQL = N'UPDATE ids		
-SET record_count = [rows]
-FROM [' + DB_NAME() + '].dbo.tbl_AdaptiveIndexDefrag_Working ids WITH (NOLOCK)
-INNER JOIN [' + DB_NAME(@dbID) + '].sys.partitions AS p WITH (NOLOCK) ON ids.objectID = p.[object_id] AND ids.indexID = p.index_id AND ids.partitionNumber = p.partition_number
-WHERE ids.[dbID] = ' + CAST(@dbID AS NVARCHAR(10));
-
-					EXECUTE sp_executesql @updateSQL;
+					RAISERROR('    Looking up additional index information (pass 1)...', 0, 42) WITH NOWAIT;
+					--PRINT @updateSQL
 				END
 				
-				IF @debugMode = 1
-				RAISERROR('    Looking up additional statistic information...', 0, 42) WITH NOWAIT;
-
-				/* Look up stats information for various purposes */
-				IF @tblName IS NULL
+				EXECUTE sp_executesql @updateSQL;
+				
+				IF @sqlmajorver = 9
 				BEGIN
-					SELECT @updateSQL = N'USE [' + DB_NAME(@dbID) + ']; 
-SELECT DISTINCT ' + CAST(@dbID AS NVARCHAR(10)) + ', ''' + QUOTENAME(DB_NAME(@dbID)) + ''', ss.[object_id], ss.stats_id, ' + CASE WHEN ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR @sqlmajorver > 12) THEN 'ISNULL(sp.partition_number,1),' ELSE '1,' END + '
-	QUOTENAME(s.name), QUOTENAME(so.name), QUOTENAME(ss.name), ss.[no_recompute], ' + CASE WHEN @sqlmajorver < 12 THEN '0 AS ' ELSE 'ss.' END + '[is_incremental], GETDATE() AS scanDate
-FROM sys.stats ss WITH (NOLOCK)
-INNER JOIN sys.objects so WITH (NOLOCK) ON ss.[object_id] = so.[object_id]
-INNER JOIN sys.schemas s WITH (NOLOCK) ON so.[schema_id] = s.[schema_id]
-LEFT JOIN sys.indexes si WITH (NOLOCK) ON ss.[object_id] = si.[object_id] and ss.name = si.name
-' + CASE WHEN ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR @sqlmajorver > 12) THEN 'CROSS APPLY sys.dm_db_stats_properties_internal(ss.[object_id], ss.stats_id) sp' ELSE '' END + '
-WHERE is_ms_shipped = 0 ' + CASE WHEN @sqlmajorver >= 12 THEN 'AND ss.is_temporary = 0' ELSE '' END + '
-	AND so.[object_id] NOT IN (SELECT sit.[object_id] FROM sys.internal_tables AS sit)
-	AND so.[type] IN (''U'',''V'')
-	AND (si.[type] IS NULL OR si.[type] NOT IN (5,6,7))' -- Avoid error 35337
+					SELECT @updateSQL = N'UPDATE ids
+SET [record_count] = [rows], [compression_type] = N''''
+FROM [' + DB_NAME(@AID_dbID) + '].dbo.tbl_AdaptiveIndexDefrag_Working ids WITH (NOLOCK)
+INNER JOIN [' + DB_NAME(@dbID) + '].sys.partitions AS p WITH (NOLOCK) ON ids.objectID = p.[object_id] AND ids.indexID = p.index_id AND ids.partitionNumber = p.partition_number
+WHERE ids.[dbID] = ' + CAST(@dbID AS NVARCHAR(10));
 				END
 				ELSE
 				BEGIN
-					DECLARE @tblNameOnly NVARCHAR(1000), @schemaNameOnly NVARCHAR(128)
-					SELECT @tblNameOnly = RIGHT(@tblName, LEN(@tblName) - CHARINDEX('.', @tblName, 1)), @schemaNameOnly = LEFT(@tblName, CHARINDEX('.', @tblName, 1) -1)
-					SELECT @updateSQL = N'USE [' + DB_NAME(@dbID) + ']; 
-SELECT DISTINCT ' + CAST(@dbID AS NVARCHAR(10)) + ', ''' + QUOTENAME(DB_NAME(@dbID)) + ''', ss.[object_id], ss.stats_id, ' + CASE WHEN ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR @sqlmajorver > 12) THEN 'ISNULL(sp.partition_number,1),' ELSE '1,' END + '
-	QUOTENAME(s.name), QUOTENAME(so.name), QUOTENAME(ss.name), ss.[no_recompute], ' + CASE WHEN @sqlmajorver < 12 THEN '0 AS ' ELSE 'ss.' END + '[is_incremental], GETDATE() AS scanDate
-FROM sys.stats ss WITH (NOLOCK)
-INNER JOIN sys.objects so WITH (NOLOCK) ON ss.[object_id] = so.[object_id]
-INNER JOIN sys.schemas s WITH (NOLOCK) ON so.[schema_id] = s.[schema_id]
-LEFT JOIN sys.indexes si WITH (NOLOCK) ON ss.[object_id] = si.[object_id] and ss.name = si.name
-' + CASE WHEN @sqlmajorver >= 12 THEN 'CROSS APPLY sys.dm_db_stats_properties_internal(ss.[object_id], ss.stats_id) sp' ELSE '' END + '
-WHERE is_ms_shipped = 0 ' + CASE WHEN @sqlmajorver >= 12 THEN 'AND ss.is_temporary = 0' ELSE '' END + '
-	AND so.[object_id] NOT IN (SELECT sit.[object_id] FROM sys.internal_tables AS sit)
-	AND s.name = ''' + @schemaNameOnly + '''
-	AND so.name = ''' + @tblNameOnly + '''
-	AND so.[type] IN (''U'',''V'')
-	AND (si.[type] IS NULL OR si.[type] NOT IN (5,6,7))' -- Avoid error 35337
+					SELECT @updateSQL = N'UPDATE ids
+SET [record_count] = [rows], [compression_type] = [data_compression_desc]
+FROM [' + DB_NAME(@AID_dbID) + '].dbo.tbl_AdaptiveIndexDefrag_Working ids WITH (NOLOCK)
+INNER JOIN [' + DB_NAME(@dbID) + '].sys.partitions AS p WITH (NOLOCK) ON ids.objectID = p.[object_id] AND ids.indexID = p.index_id AND ids.partitionNumber = p.partition_number
+WHERE ids.[dbID] = ' + CAST(@dbID AS NVARCHAR(10));
 				END
+
+				IF @debugMode = 1
+				BEGIN
+					RAISERROR('    Looking up additional index information (pass 2)...', 0, 42) WITH NOWAIT;
+					--PRINT @updateSQL
+				END
+				
+				EXECUTE sp_executesql @updateSQL;
+				
+				IF @debugMode = 1
+				RAISERROR('    Looking up additional statistic information...', 0, 42) WITH NOWAIT;
+				
+				/* Look up stats information for various purposes */
+				DECLARE @tblNameOnly NVARCHAR(1000), @schemaNameOnly NVARCHAR(128)
+				IF @tblName IS NOT NULL
+				BEGIN
+					SELECT @tblNameOnly = RIGHT(@tblName, LEN(@tblName) - CHARINDEX('.', @tblName, 1)), @schemaNameOnly = LEFT(@tblName, CHARINDEX('.', @tblName, 1) -1)
+				END
+				
+				SELECT @updateSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE [' + DB_NAME(@dbID) + '];
+' ELSE '' END + 'SELECT DISTINCT ' + CAST(@dbID AS NVARCHAR(10)) + ', ''[' + DB_NAME(@dbID) + ']'', ss.[object_id], ss.stats_id, ' + CASE WHEN ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR @sqlmajorver > 12) THEN 'ISNULL(sp.partition_number,1),' ELSE '1,' END + '
+	QUOTENAME(s.name), QUOTENAME(so.name), QUOTENAME(ss.name), ss.[no_recompute], ' + CASE WHEN @sqlmajorver < 12 THEN '0 AS ' ELSE 'ss.' END + '[is_incremental], GETDATE() AS scanDate
+FROM sys.stats AS ss WITH (NOLOCK)
+INNER JOIN sys.objects AS so WITH (NOLOCK) ON ss.[object_id] = so.[object_id]
+INNER JOIN sys.schemas AS s WITH (NOLOCK) ON so.[schema_id] = s.[schema_id]' +
+CASE WHEN @updateStatsWhere = 0 THEN 'LEFT JOIN' ELSE 'INNER JOIN' END + -- @updateStatsWhere = 0 then table-wide statistics;
+' sys.indexes AS si WITH (NOLOCK) ON ss.[object_id] = si.[object_id] and ss.name = si.name' +
+CASE WHEN @dbScope IS NULL AND @tblName IS NULL THEN CHAR(10) + CHAR(10) + 'LEFT JOIN [' + DB_NAME(@AID_dbID) + '].dbo.tbl_AdaptiveIndexDefrag_Exceptions AS ide ON ide.[dbID] = ' + CONVERT(NVARCHAR(10),@dbID) + ' AND ide.objectID = so.[object_id]' ELSE '' END +
+CASE WHEN ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR @sqlmajorver > 12) THEN CHAR(10) + 'CROSS APPLY sys.dm_db_stats_properties_internal(ss.[object_id], ss.stats_id) sp' ELSE '' END + 
+CHAR(10) + 'WHERE is_ms_shipped = 0 ' + CASE WHEN @sqlmajorver >= 12 THEN 'AND ss.is_temporary = 0' ELSE '' END + '
+	AND so.[object_id] NOT IN (SELECT sit.[object_id] FROM sys.internal_tables AS sit)
+	AND so.[type] IN (''U'',''V'')
+	AND (si.[type] IS NULL OR si.[type] NOT IN (5,6,7))' + -- Avoid error 35337
+CASE WHEN @dbScope IS NOT NULL AND @tblName IS NOT NULL THEN CHAR(10) + 'AND s.name = ''' + @schemaNameOnly + ''' AND so.name = ''' + @tblNameOnly + ''';' ELSE ';' END
 				
 				INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Stats_Working (dbID, dbName, objectID, statsID, partitionNumber, schemaName, objectName, statsName, [no_recompute], [is_incremental], scanDate)
 				EXECUTE sp_executesql @updateSQL;
@@ -1805,7 +1736,7 @@ FROM dbo.tbl_AdaptiveIndexDefrag_Working WHERE defragDate IS NULL '
 + CASE WHEN @Exec_Print = 0 THEN 'AND printStatus = 0 ' ELSE '' END + '		
 AND exclusionMask & POWER(2, DATEPART(weekday, GETDATE())-1) = 0
 AND page_count BETWEEN @p_minPageCount AND ISNULL(@p_maxPageCount, page_count)		
-ORDER BY + ' + @defragOrderColumn + ' ' + @defragSortOrder;
+ORDER BY + ' + @defragOrderColumn + ' ' + @defragSortOrder + ', objectID DESC';
 
 			SET @getIndexSQL_Param = N'@objectID_Out int OUTPUT, @indexID_Out int OUTPUT, @dbID_Out int OUTPUT, @p_minPageCount int, @p_maxPageCount int';
 			EXECUTE sp_executesql @getIndexSQL, @getIndexSQL_Param, @p_minPageCount = @minPageCount, @p_maxPageCount = @maxPageCount, @objectID_Out = @objectID OUTPUT, @indexID_Out = @indexID OUTPUT, @dbID_Out = @dbID OUTPUT;
@@ -1820,17 +1751,23 @@ ORDER BY + ' + @defragOrderColumn + ' ' + @defragSortOrder;
 			
 			IF @debugMode = 1
 			RAISERROR('  Getting selected index information...', 0, 42) WITH NOWAIT;
-			
+
 			/* Get object names and info */
 			IF @partitionCount > 1 AND @dealMaxPartition IS NOT NULL AND @editionCheck = 1
 			BEGIN
-				SELECT TOP 1 @objectName = objectName, @schemaName = schemaName, @indexName = indexName, @dbName = dbName, @fragmentation = fragmentation, @partitionNumber = partitionNumber, @pageCount = page_count, @range_scan_count = range_scan_count, @is_primary_key = is_primary_key, @fill_factor = fill_factor, @record_count = record_count, @ixtype = [type], @is_disabled = is_disabled, @is_padded = is_padded, @has_filter = has_filter
+				IF @debugMode = 1
+				RAISERROR('  	Partition number specific...', 0, 42) WITH NOWAIT;
+
+				SELECT TOP 1 @objectName = objectName, @schemaName = schemaName, @indexName = indexName, @dbName = dbName, @fragmentation = fragmentation, @partitionNumber = partitionNumber, @pageCount = page_count, @range_scan_count = range_scan_count, @is_primary_key = is_primary_key, @fill_factor = fill_factor, @record_count = record_count, @ixtype = [type], @is_disabled = is_disabled, @is_padded = is_padded, @has_filter = has_filter, @currCompression = [compression_type]
 				FROM dbo.tbl_AdaptiveIndexDefrag_Working
-				WHERE objectID = @objectID AND indexID = @indexID AND dbID = @dbID AND ((@Exec_Print = 1 AND defragDate IS NULL) OR (@Exec_Print = 0 AND defragDate IS NULL AND printStatus = 0));
+				WHERE objectID = @objectID AND indexID = @indexID AND dbID = @dbID AND ((@Exec_Print = 1 AND defragDate IS NULL) OR (@Exec_Print = 0 AND defragDate IS NULL AND printStatus = 0))
+				ORDER BY partitionNumber ASC; -- ensure that we have always the same sequence in order to continue resumeable operations
 			END
 			ELSE
 			BEGIN
-				SELECT TOP 1 @objectName = objectName, @schemaName = schemaName, @indexName = indexName, @dbName = dbName, @fragmentation = fragmentation, @partitionNumber = NULL, @pageCount = page_count, @range_scan_count = range_scan_count, @is_primary_key = is_primary_key, @fill_factor = fill_factor, @record_count = record_count, @ixtype = [type], @is_disabled = is_disabled, @is_padded = is_padded, @has_filter = has_filter
+				RAISERROR('  	Not partition number specific...', 0, 42) WITH NOWAIT;
+
+				SELECT TOP 1 @objectName = objectName, @schemaName = schemaName, @indexName = indexName, @dbName = dbName, @fragmentation = fragmentation, @partitionNumber = NULL, @pageCount = page_count, @range_scan_count = range_scan_count, @is_primary_key = is_primary_key, @fill_factor = fill_factor, @record_count = record_count, @ixtype = [type], @is_disabled = is_disabled, @is_padded = is_padded, @has_filter = has_filter, @currCompression = [compression_type]
 				FROM dbo.tbl_AdaptiveIndexDefrag_Working
 				WHERE objectID = @objectID AND indexID = @indexID AND dbID = @dbID AND ((@Exec_Print = 1 AND defragDate IS NULL) OR (@Exec_Print = 0 AND defragDate IS NULL AND printStatus = 0));
 			END
@@ -1959,8 +1896,8 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 			END
 			/* If the index is heavily fragmented and doesn't contain any partitions,
 			or if the index does not allow page locks, or if it is a filtered index, rebuild it */
-			ELSE IF (@fragmentation >= @rebuildThreshold AND @ixtype IN (1,2))
-				OR (@fragmentation >= @rebuildThreshold_cs AND @ixtype IN (5,6))
+			ELSE IF ((@fragmentation >= @rebuildThreshold AND @ixtype IN (1,2)) OR @rebuildThreshold = 0)
+				OR ((@fragmentation >= @rebuildThreshold_cs AND @ixtype IN (5,6)) OR @rebuildThreshold_cs = 0)
 				OR @has_filter = 1 OR @allowPageLocks = 0
 			BEGIN			
 				SET @rebuildcommand = N' REBUILD'
@@ -1979,31 +1916,56 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 				/* Set defrag options*/
 				SET @rebuildcommand = @rebuildcommand + N' WITH ('
 				
-				/* Set index pad options; not compatible with partition operations*/
+				/* Set index pad options; not compatible with partition operations */
 				IF @is_padded = 1 AND (@dealMaxPartition IS NULL OR (@dealMaxPartition IS NOT NULL AND @partitionCount = 1))
 				SET @rebuildcommand = @rebuildcommand + N'PAD_INDEX = ON, '
 				
+				/* Sets specific compression options for indexes */
+				IF @dataCompression IN ('NONE','PAGE','ROW') 
+					AND (@dealMaxPartition IS NULL OR (@dealMaxPartition IS NOT NULL AND @partitionCount = 1))
+					AND @ixtype IN (1,2)
+					AND (@sqlmajorver > 13 OR (@sqlmajorver = 13 AND @sqlbuild >= 4001) OR @editionCheck = 1) -- SQL 2016 SP1 or higher	for compression in non-EE
+				SET @rebuildcommand = @rebuildcommand + N'DATA_COMPRESSION = ' + @dataCompression + ', '
+				
+				IF @dataCompression IS NULL 
+					AND (@dealMaxPartition IS NULL OR (@dealMaxPartition IS NOT NULL AND @partitionCount = 1))
+					AND @ixtype IN (1,2)
+					AND (@sqlmajorver > 13 OR (@sqlmajorver = 13 AND @sqlbuild >= 4001) OR @editionCheck = 1) -- SQL 2016 SP1 or higher	for compression in non-EE
+				SET @rebuildcommand = @rebuildcommand + N'DATA_COMPRESSION = ' + @currCompression + ', '
+				
+				IF @dataCompression IN ('NONE','PAGE','ROW') AND @ixtype IN (1,2)
+					AND @partitionCount > 1 AND @dealMaxPartition IS NOT NULL AND @editionCheck = 1
+				SET @rebuildcommand = @rebuildcommand + N'DATA_COMPRESSION = ' + @dataCompression + ' ON PARTITIONS (' + CAST(@partitionNumber AS NVARCHAR(10)) + '), '
+
+				IF @dataCompression IS NULL AND @ixtype IN (1,2)
+					AND @partitionCount > 1 AND @dealMaxPartition IS NOT NULL AND @editionCheck = 1
+				SET @rebuildcommand = @rebuildcommand + N'DATA_COMPRESSION = ' + @currCompression + ' ON PARTITIONS (' + CAST(@partitionNumber AS NVARCHAR(10)) + '), '
+
 				/* Set online rebuild options; requires Enterprise Edition; not compatible with partition operations, Columnstore indexes in table and XML or Spatial indexes.
-				Up to SQL Server 2008R2, not compatible with clustered indexes with LOB columnns in table or non-clustered indexes with LOBs in INCLUDED columns.
-				In SQL Server 2012, not compatible with clustered indexes with LOB columnns in table.*/		
+				Up to SQL Server 2008R2, not compatible with clustered indexes with LOB columns in table or non-clustered indexes with LOBs in INCLUDED columns.
+				In SQL Server 2012, not compatible with clustered indexes with LOB columns in table.*/		
 				IF @sqlmajorver <= 11 AND @onlineRebuild = 1 AND @editionCheck = 1
 					AND @ixtype IN (1,2) AND @containsLOB = 0
 					AND (@dealMaxPartition IS NULL OR (@dealMaxPartition IS NOT NULL AND @partitionCount = 1))	
 				SET @rebuildcommand = @rebuildcommand + N'ONLINE = ON, ';
 				
 				/* Set online rebuild options; requires Enterprise Edition; not compatible with partition operations, Columnstore indexes in table and XML or Spatial indexes.
-				In SQL Server 2014, not compatible with clustered indexes with LOB columnns in table, but compatible with partition operations.
-				Also, we can use Lock Priority with online indexing.*/	
+				In SQL Server 2014, not compatible with clustered indexes with LOB columns in table, but compatible with partition operations.
+				Also, we can use Lock Priority with online indexing. */	
 				IF @sqlmajorver > 11 AND @onlineRebuild = 1 AND @editionCheck = 1
 					AND @ixtype IN (1,2) AND @containsLOB = 0
 				SELECT @rebuildcommand = @rebuildcommand + N'ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = ' + CONVERT(NVARCHAR(15), @onlinelocktimeout) + ', ABORT_AFTER_WAIT = ' + CASE WHEN @abortAfterwait = 0 THEN 'BLOCKERS' WHEN @abortAfterwait = 1 THEN 'SELF' ELSE 'NONE' END + ')), '
 
-				/* Set fill factor operation preferences; not compatible with partition operations and Columnstore indexes*/		
+				/* Set fill factor operation preferences; not compatible with partition operations and Columnstore indexes */		
 				IF @fillfactor = 1 AND (@dealMaxPartition IS NULL OR (@dealMaxPartition IS NOT NULL AND @partitionCount = 1)) AND @ixtype IN (1,2) 		
 				SET @rebuildcommand = @rebuildcommand + N'FILLFACTOR = ' + CONVERT(NVARCHAR, CASE WHEN @fill_factor = 0 THEN 100 ELSE @fill_factor END) + N', ';
 
 				IF @fillfactor = 0 AND (@dealMaxPartition IS NULL OR (@dealMaxPartition IS NOT NULL AND @partitionCount = 1)) AND @ixtype IN (1,2)		
 				SET @rebuildcommand = @rebuildcommand + N'FILLFACTOR = 100, ';
+
+				/* Resumable requires an ONLINE rebuild and version >= SQL Server 2017 */
+				IF @sqlmajorver >= 14 AND @onlineRebuild = 1 AND @resumableRebuild = 1
+				SET @rebuildcommand = @rebuildcommand + N'RESUMABLE = ON, ';	
 
 				/* Set sort operation preferences */
 				IF @sortInTempDB = 1 AND @ixtype IN (1,2)
@@ -2019,7 +1981,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 				/* Set processor restriction options; requires Enterprise Edition */		
 				IF @maxDopRestriction IS NOT NULL AND @editionCheck = 1		
-				SET @rebuildcommand = @rebuildcommand + N'MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(2)) + N');';
+				SET @rebuildcommand = @rebuildcommand + N'MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3)) + N');';
 				ELSE		
 				SET @rebuildcommand = @rebuildcommand + N');';
 
@@ -2040,18 +2002,48 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 				/* Is stat incremental? */
 				SELECT TOP 1 @stats_isincremental = [is_incremental] FROM dbo.tbl_AdaptiveIndexDefrag_Stats_Working 
 				WHERE dbName = @dbName AND schemaName = @schemaName AND objectName = @objectName AND statsName = @indexName;
+
+				/* Are there paused index operations? */
+				DECLARE @sqlcmdRI NVARCHAR(100), @paramsRI NVARCHAR(50), @HasRI int
+				SET @HasRI = 0
+				IF @sqlmajorver > 14
+				BEGIN
+					SET @sqlcmdRI = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @HasRI_OUT = COUNT(*) FROM sys.index_resumable_operations'
+					SET @paramsRI = N'@HasRI_OUT int OUTPUT'
 				
-				IF (@sqlmajorver < 13 OR @partitionCount = 1) AND @sqldisablecommand IS NULL AND @ixtype IN (1,2)
+					EXECUTE sp_executesql @sqlcmdRI, @paramsRI, @HasRI_OUT = @HasRI OUTPUT
+				END;
+				
+				IF @HasRI > 0
+				BEGIN
+					IF @debugMode = 1
+					RAISERROR('    Found ongoing resumable index operations - skipping all pre-commands...', 0, 42) WITH NOWAIT;
+					
+					SET @sqlprecommand = N''
+				END
+				ELSE IF (@sqlmajorver < 13 OR @partitionCount = 1) AND @sqldisablecommand IS NULL AND @ixtype IN (1,2)
 				BEGIN
 					SET @sqlprecommand = N'UPDATE STATISTICS ' + @dbName + N'.' + @schemaName + N'.' + @objectName + N' (' + @indexName + N')'
-					SET @sqlprecommand = @sqlprecommand + N'; '
+					
+					/* Set processor restriction options */		
+					IF @maxDopRestriction IS NOT NULL	
+						AND ((@sqlmajorver >= 14 AND @sqlbuild >= 3015) /*OR (@sqlmajorver = 13 AND @sqlbuild >= xxxx)*/) -- SQL 2016 SP2, SQL 2017 CU3 or higher for MAXDOP in stats
+					SET @sqlprecommand = @sqlprecommand + N' WITH MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3)) + N'; ';
+					ELSE		
+					SET @sqlprecommand = @sqlprecommand + N'; ';
 				END
 				ELSE IF @sqlmajorver >= 13 AND @partitionCount > 1 AND @stats_isincremental = 1 AND @sqldisablecommand IS NULL AND @ixtype IN (1,2)
 				BEGIN
 					SET @sqlprecommand = N'UPDATE STATISTICS ' + @dbName + N'.' + @schemaName + N'.' + @objectName + N' (' + @indexName + N') WITH RESAMPLE ON PARTITIONS(' + CONVERT(NVARCHAR(10), @partitionNumber) + N')'
+					
+					/* Set processor restriction options */		
+					IF @maxDopRestriction IS NOT NULL	
+						AND ((@sqlmajorver >= 14 AND @sqlbuild >= 3015) /*OR (@sqlmajorver = 13 AND @sqlbuild >= xxxx)*/) -- SQL 2016 SP2, SQL 2017 CU3 or higher for MAXDOP in stats
+					SET @sqlprecommand = @sqlprecommand + N' WITH MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3)) + N'; ';
+					ELSE					
 					SET @sqlprecommand = @sqlprecommand + N'; '
 				END
-
+				
 				/* Set Rebuild command */
 				SET @sqlcommand = N'ALTER INDEX ' + @indexName + N' ON ' + @dbName + N'.' + @schemaName + N'.' + @objectName + REPLACE(@rebuildcommand,', )', ')');
 				
@@ -2128,10 +2120,10 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 						SET @sqlprecommand = NULL
 						SET @dateTimeEnd = GETDATE();
 					
-						/* Update log with completion time */	
-						UPDATE dbo.tbl_AdaptiveIndexDefrag_log	
-						SET dateTimeEnd = @dateTimeEnd, durationSeconds = DATEDIFF(second, @dateTimeStart, @dateTimeEnd)
-						WHERE indexDefrag_id = @indexDefrag_id AND dateTimeEnd IS NULL;
+						-- /* Update log with completion time */ --> if logged here, completion time after actual rebuild is not logged	
+						-- UPDATE dbo.tbl_AdaptiveIndexDefrag_log	
+						-- SET dateTimeEnd = @dateTimeEnd, durationSeconds = DATEDIFF(second, @dateTimeStart, @dateTimeEnd)
+						-- WHERE indexDefrag_id = @indexDefrag_id AND dateTimeEnd IS NULL;
 						
 						/* If rebuilding, update statistics log with completion time */
 						IF @partitionCount > 1 AND @dealMaxPartition IS NOT NULL AND @editionCheck = 1
@@ -2156,7 +2148,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					BEGIN CATCH						
 						/* Update log with error message */	
 						UPDATE dbo.tbl_AdaptiveIndexDefrag_log	
-						SET dateTimeEnd = GETDATE(), durationSeconds = -1, errorMessage = 'Error ' + CONVERT(NVARCHAR(20),ERROR_NUMBER()) + ' has occurred executing the pre-command. Message: ' + ERROR_MESSAGE() + ' (Line Number: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')'
+						SET dateTimeEnd = GETDATE(), durationSeconds = -1, errorMessage = 'Error ' + CONVERT(NVARCHAR(20),ERROR_NUMBER()) + ' has occurred executing the pre-command for index ' + @indexName +'. Message: ' + ERROR_MESSAGE() + ' (Line Number: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')'
 						WHERE indexDefrag_id = @indexDefrag_id AND dateTimeEnd IS NULL;
 
 						IF @debugMode = 1
@@ -2267,7 +2259,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 				BEGIN
 					SET @debugMessage = '     ' + @sqldisablecommand + CHAR(10) + '     ' + @sqlprecommand + CHAR(10) + '     ' + @sqlcommand;
 				END;
-												
+				
 				/* Print the commands we're executing if specified to do so */				
 				IF (@debugMode = 1 OR @printCmds = 1) AND @sqlcommand IS NOT NULL
 				BEGIN
@@ -2311,6 +2303,8 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					SET @getStatSQL = N'SELECT TOP 1 @statsID_Out = idss.statsID FROM dbo.tbl_AdaptiveIndexDefrag_Stats_Working idss WHERE idss.updateDate IS NULL ' + CASE WHEN @Exec_Print = 0 THEN 'AND idss.printStatus = 0 ' ELSE '' END + ' AND idss.[dbID] = ' + CONVERT(NVARCHAR, @dbID) + ' AND idss.statsName = ''' + @indexName + '''' + ' AND idss.objectID = ' + CONVERT(NVARCHAR, @objectID) + ' AND EXISTS (SELECT TOP 1 objectID FROM dbo.tbl_AdaptiveIndexDefrag_Working ids WHERE ids.[dbID] = idss.[dbID] AND ids.objectID = idss.objectID AND idss.statsName = ids.indexName AND idss.updateDate IS NULL AND ids.defragDate IS NOT NULL AND ids.exclusionMask & POWER(2, DATEPART(weekday, GETDATE())-1) = 0)';
 					SET @getStatSQL_Param = N'@statsID_Out int OUTPUT'
 					EXECUTE sp_executesql @getStatSQL, @getStatSQL_Param, @statsID_Out = @statsID OUTPUT;
+					
+					SET @statsName = @indexName
 				END TRY
 				BEGIN CATCH						
 					IF @debugMode = 1
@@ -2331,39 +2325,44 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 				IF @debugMode = 1
 				BEGIN
 					SET @debugMessage = '   Determining modification row counter for statistic ' + @statsName + ' on table or view ' + @objectName + ' of DB ' + @dbName + '...';
+					
+					IF @debugMessage IS NOT NULL
 					RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 				END;
 
 				/* Determine modification row counter to ascertain if update stats is required */
-				IF ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR (@sqlmajorver = 13 AND @sqlbuild >= 4000) OR @sqlmajorver > 13) AND @stats_isincremental = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
+				IF ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR (@sqlmajorver = 13 AND @sqlbuild >= 4000) OR @sqlmajorver > 13) AND ISNULL(@stats_isincremental,1) = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.dm_db_incremental_stats_properties DMF...', 0, 42) WITH NOWAIT;
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_incremental_stats_properties(' + CAST(@statsobjectID AS NVARCHAR(10)) + ',' + CAST(@statsID AS NVARCHAR(10)) + ') WHERE partition_number = @partitionNumber_In;'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_incremental_stats_properties(@statsobjectID_In, @statsID_In) WHERE partition_number = @partitionNumber_In;'
 				END
-				ELSE IF ((@sqlmajorver = 12 AND @sqlbuild < 5000) OR (@sqlmajorver = 13 AND @sqlbuild < 4000)) AND @stats_isincremental = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
+				ELSE IF ((@sqlmajorver = 12 AND @sqlbuild < 5000) OR (@sqlmajorver = 13 AND @sqlbuild < 4000)) AND ISNULL(@stats_isincremental,1) = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.dm_db_stats_properties_internal DMF...', 0, 42) WITH NOWAIT;
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties_internal(' + CAST(@statsobjectID AS NVARCHAR(10)) + ',' + CAST(@statsID AS NVARCHAR(10)) + ') WHERE partition_number = @partitionNumber_In;'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties_internal(@statsobjectID_In, @statsID_In) WHERE partition_number = @partitionNumber_In;'
 				END
-				ELSE IF ((@sqlmajorver = 10 AND @sqlminorver = 50 AND @sqlbuild >= 4000) OR (@sqlmajorver = 11 AND @sqlbuild >= 3000) OR @sqlmajorver >= 12) AND (@stats_isincremental = 0 OR UPPER(@statsSample) = 'FULLSCAN' OR ISNUMERIC(@statsSample) = 1)
+				ELSE IF ((@sqlmajorver = 10 AND @sqlminorver = 50 AND @sqlbuild >= 4000) OR (@sqlmajorver = 11 AND @sqlbuild >= 3000) OR @sqlmajorver >= 12) AND (ISNULL(@stats_isincremental,1) = 0 OR UPPER(@statsSample) = 'FULLSCAN' OR ISNUMERIC(@statsSample) = 1)
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.dm_db_stats_properties DMF...', 0, 42) WITH NOWAIT;
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties(' + CAST(@statsobjectID AS NVARCHAR(10)) + ',' + CAST(@statsID AS NVARCHAR(10)) + ');'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties(@statsobjectID_In, @statsID_In);'
 				END
 				ELSE
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.sysindexes...', 0, 42) WITH NOWAIT;
 					SELECT TOP 1 @surrogateStatsID = indexID FROM dbo.tbl_AdaptiveIndexDefrag_Working (NOLOCK) WHERE objectID = @statsobjectID AND indexName = @statsName 
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = SUM(ISNULL(rowmodctr,0)), @rows_Out = ISNULL(rowcnt,0), @rows_sampled_Out = -1 FROM sys.sysindexes WHERE id = ' + CAST(@statsobjectID AS NVARCHAR(10)) + ' AND indid = ' + CAST(@surrogateStatsID AS NVARCHAR(10)) + ' AND rowmodctr > 0;'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = SUM(ISNULL(rowmodctr,0)), @rows_Out = ISNULL(rowcnt,0), @rows_sampled_Out = -1 FROM sys.sysindexes WHERE id = @statsobjectID_In AND indid = @statsID_In AND rowmodctr > 0;'
+					
+					IF @statsID IS NULL
+					SET @statsID = @surrogateStatsID	
 				END
-				SET @rowmodctrSQL_Param = N'@partitionNumber_In smallint, @rowmodctr_Out bigint OUTPUT, @rows_Out bigint OUTPUT, @rows_sampled_Out bigint OUTPUT'
+				SET @rowmodctrSQL_Param = N'@partitionNumber_In smallint, @statsobjectID_In int, @statsID_In int, @rowmodctr_Out bigint OUTPUT, @rows_Out bigint OUTPUT, @rows_sampled_Out bigint OUTPUT'
 
 				BEGIN TRY
-					EXECUTE sp_executesql @rowmodctrSQL, @rowmodctrSQL_Param, @partitionNumber_In = @partitionNumber, @rowmodctr_Out = @rowmodctr OUTPUT, @rows_Out = @rows OUTPUT, @rows_sampled_Out = @rows_sampled OUTPUT;
+					EXECUTE sp_executesql @rowmodctrSQL, @rowmodctrSQL_Param, @statsobjectID_In = @statsobjectID, @statsID_In = @statsID, @partitionNumber_In = @partitionNumber, @rowmodctr_Out = @rowmodctr OUTPUT, @rows_Out = @rows OUTPUT, @rows_sampled_Out = @rows_sampled OUTPUT;
 					SET @rowmodctr = (SELECT ISNULL(@rowmodctr, 0));
 				END TRY
 				BEGIN CATCH						
@@ -2379,15 +2378,15 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 				IF @debugMode = 1
 				BEGIN
-					SELECT @debugMessage = '     Found a row modification counter of ' + CONVERT(NVARCHAR(10), @rowmodctr) + ' and ' + CONVERT(NVARCHAR(10), @record_count) + ' rows' + CASE WHEN @stats_isincremental = 1 THEN ' on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
+					SELECT @debugMessage = '     Found a row modification counter of ' + CONVERT(NVARCHAR(15), @rowmodctr) + ' and ' + CONVERT(NVARCHAR(15), @record_count) + ' rows' + CASE WHEN ISNULL(@stats_isincremental,0) = 1 THEN ' on partition ' + CONVERT(NVARCHAR(15), @partitionNumber) ELSE '' END + '...';
 					RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 				END
-				
+
 				/* Because we are reorganizing, we will update statistics if they have changed since last update with same threshold as TF2371.
 				Default rules for auto update stats are:
 				If the cardinality for a table is greater than 6, but less than or equal to 500, update status every 500 modifications.
 				If the cardinality for a table is greater than 500, update statistics when (500 + 20 percent of the table) changes have occurred.
-				Reference: http://support.microsoft.com/kb/195565
+				Reference: http://docs.microsoft.com/sql/relational-databases/statistics/statistics and http://support.microsoft.com/kb/195565
 				*/
 				IF (@statsThreshold IS NOT NULL AND @statsThreshold BETWEEN 0.001 AND 100.0 AND @statsMinRows IS NULL AND (@rowmodctr*100)/@record_count >= @statsThreshold)
 					OR (@statsThreshold IS NOT NULL AND @statsThreshold BETWEEN 0.001 AND 100.0 AND @statsMinRows IS NOT NULL AND @record_count >= @statsMinRows AND (@rowmodctr*100)/@record_count >= @statsThreshold)
@@ -2424,7 +2423,16 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					ELSE IF @stats_norecompute = 1 AND @sqlcommand2 NOT LIKE '%WITH%'
 					SET @sqlcommand2 = @sqlcommand2 + N' WITH NORECOMPUTE'
 					
-					/* For list of incremental stats unsupported scenarios check https://msdn.microsoft.com/en-us/library/ms187348.aspx */
+					IF @maxDopRestriction IS NOT NULL	
+						AND ((@sqlmajorver >= 14 AND @sqlbuild >= 3015) /*OR (@sqlmajorver = 13 AND @sqlbuild >= xxxx)*/) -- SQL 2016 SP2, SQL 2017 CU3 or higher for MAXDOP in stats
+						AND UPPER(@sqlcommand2) LIKE '%WITH%'
+					SET @sqlcommand2 = @sqlcommand2 + N' ,MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3));
+					ELSE IF @maxDopRestriction IS NOT NULL	
+						AND ((@sqlmajorver >= 14 AND @sqlbuild >= 3015) /*OR (@sqlmajorver = 13 AND @sqlbuild >= xxxx)*/) -- SQL 2016 SP2, SQL 2017 CU3 or higher for MAXDOP in stats
+						AND UPPER(@sqlcommand2) NOT LIKE '%WITH%'	
+					SET @sqlcommand2 = @sqlcommand2 + N' WITH MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3));
+					
+					/* For list of incremental stats unsupported scenarios check http://docs.microsoft.com/sql/t-sql/statements/update-statistics-transact-sql */
 					IF @partitionCount > 1 AND @statsIncremental = 1 AND @has_filter = 0
 					BEGIN
 						IF UPPER(@sqlcommand2) LIKE '%WITH%'
@@ -2461,7 +2469,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 					/* Log actions */		
 					INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Stats_log (dbID, dbName, objectID, objectName, statsID, statsName, [partitionNumber], [rows], rows_sampled, modification_counter, [no_recompute], dateTimeStart, sqlStatement)		
-					SELECT @dbID, @dbName, @objectID, @objectName, @statsID, @statsName, @partitionNumber, @rows, @rows_sampled, @rowmodctr, @stats_norecompute, @dateTimeStart, @sqlcommand2;
+					SELECT @dbID, @dbName, @objectID, @objectName, @statsID, @statsName, @partitionNumber, @record_count, @rows_sampled, @rowmodctr, @stats_norecompute, @dateTimeStart, @sqlcommand2;
 
 					SET @statsUpdate_id = SCOPE_IDENTITY();
 
@@ -2522,12 +2530,18 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					UPDATE dbo.tbl_AdaptiveIndexDefrag_Stats_Working		
 					SET updateDate = GETDATE(), printStatus = 1	
 					WHERE dbID = @dbID AND objectID = @objectID AND statsID = @statsID AND partitionNumber = @partitionNumber;
+					
+					/* Log actions */		
+					INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Stats_log (dbID, dbName, objectID, objectName, statsID, statsName, [partitionNumber], [rows], rows_sampled, modification_counter, [no_recompute], dateTimeStart, dateTimeEnd, durationSeconds, sqlStatement)		
+					SELECT @dbID, @dbName, @objectID, @objectName, @statsID, @statsName, @partitionNumber, @record_count, ISNULL(@rows_sampled,-1), @rowmodctr, @stats_norecompute, @dateTimeStart, @dateTimeStart, -1, @sqlcommand2;
 				END
-				ELSE IF @Exec_Print = 0 
+				ELSE IF @Exec_Print = 0
 				BEGIN
 					IF @debugMode = 1 AND @sqlcommand2 IS NULL
 					BEGIN
 						SET @debugMessage = '     No need to update statistic ' + @statsName + ' on table or view ' + @objectName + ' of DB ' + @dbName + CASE WHEN @stats_isincremental = 1 THEN ', on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
+						
+						IF @debugMessage IS NOT NULL
 						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					END
 					
@@ -2535,17 +2549,21 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					IF (@printCmds = 1 OR @debugMode = 1) AND @sqlcommand2 IS NOT NULL
 					BEGIN
 						SET @debugMessage = '     ' + @sqlcommand2;
+						
+						IF @debugMessage IS NOT NULL
 						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					END
 
 					IF @printCmds = 1 AND @debugMode = 0 AND @sqlcommand2 IS NULL
 					BEGIN
-						 SET @debugMessage = '     -- No need to update statistic ' + @statsName + ' on table or view ' + @objectName + ' of DB ' + @dbName + CASE WHEN @stats_isincremental = 1 THEN ', on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
-						 RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
+						SET @debugMessage = '     -- No need to update statistic ' + @statsName + ' on table or view ' + @objectName + ' of DB ' + @dbName + CASE WHEN @stats_isincremental = 1 THEN ', on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
+						
+						IF @debugMessage IS NOT NULL
+						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					END
 
 					/* Update working table */
-					UPDATE dbo.tbl_AdaptiveIndexDefrag_Stats_Working		
+					UPDATE dbo.tbl_AdaptiveIndexDefrag_Stats_Working
 					SET printStatus = 1
 					WHERE dbID = @dbID AND objectID = @objectID AND statsID = @statsID AND partitionNumber = @partitionNumber;
 				END
@@ -2585,7 +2603,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 				/* Get stat associated table record count */
 				BEGIN TRY
-					SELECT @getStatSQL = N'USE ' + @dbName + '; SELECT TOP 1 @record_count_Out = p.[rows] FROM [' + DB_NAME() + '].dbo.tbl_AdaptiveIndexDefrag_Stats_Working idss INNER JOIN sys.partitions AS p ON idss.objectID = p.[object_id] AND idss.partitionNumber = p.partition_number WHERE idss.updateDate IS NULL ' + CASE WHEN @Exec_Print = 0 THEN 'AND idss.printStatus = 0 ' ELSE '' END + ' AND idss.statsID = @statsID_In AND idss.dbID = @dbID_In AND idss.objectID = @statsobjectID_In' 
+					SELECT @getStatSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT TOP 1 @record_count_Out = p.[rows] FROM [' + DB_NAME(@AID_dbID) + '].dbo.tbl_AdaptiveIndexDefrag_Stats_Working idss INNER JOIN sys.partitions AS p ON idss.objectID = p.[object_id] AND idss.partitionNumber = p.partition_number WHERE idss.updateDate IS NULL ' + CASE WHEN @Exec_Print = 0 THEN 'AND idss.printStatus = 0 ' ELSE '' END + ' AND idss.statsID = @statsID_In AND idss.dbID = @dbID_In AND idss.objectID = @statsobjectID_In' 
 					SET @getStatSQL_Param = N'@statsID_In int, @dbID_In int, @statsobjectID_In int, @record_count_Out bigint OUTPUT'
 					EXECUTE sp_executesql @getStatSQL, @getStatSQL_Param, @statsID_In = @statsID, @dbID_In = @dbID, @statsobjectID_In = @statsobjectID, @record_count_Out = @record_count OUTPUT;
 				END TRY
@@ -2612,35 +2630,38 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 				END
  
 				/* Determine modification row counter to ascertain if update stats is required */
-				IF ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR (@sqlmajorver = 13 AND @sqlbuild >= 4000) OR @sqlmajorver > 13) AND @stats_isincremental = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
+				IF ((@sqlmajorver = 12 AND @sqlbuild >= 5000) OR (@sqlmajorver = 13 AND @sqlbuild >= 4000) OR @sqlmajorver > 13) AND ISNULL(@stats_isincremental,1) = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.dm_db_incremental_stats_properties DMF...', 0, 42) WITH NOWAIT;
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_incremental_stats_properties(' + CAST(@statsobjectID AS NVARCHAR(10)) + ',' + CAST(@statsID AS NVARCHAR(10)) + ') WHERE partition_number = @partitionNumber_In;'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_incremental_stats_properties(@statsobjectID_In, @statsID_In) WHERE partition_number = @partitionNumber_In;'
 				END
-				ELSE IF ((@sqlmajorver = 12 AND @sqlbuild < 5000) OR (@sqlmajorver = 13 AND @sqlbuild < 4000)) AND @stats_isincremental = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
+				ELSE IF ((@sqlmajorver = 12 AND @sqlbuild < 5000) OR (@sqlmajorver = 13 AND @sqlbuild < 4000)) AND ISNULL(@stats_isincremental,1) = 1 AND (@statsSample IS NULL OR UPPER(@statsSample) = 'RESAMPLE')
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.dm_db_stats_properties_internal DMF...', 0, 42) WITH NOWAIT;
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties_internal(' + CAST(@statsobjectID AS NVARCHAR(10)) + ',' + CAST(@statsID AS NVARCHAR(10)) + ') WHERE partition_number = @partitionNumber_In;'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties_internal(@statsobjectID_In, @statsID_In) WHERE partition_number = @partitionNumber_In;'
 				END
-				ELSE IF ((@sqlmajorver = 10 AND @sqlminorver = 50 AND @sqlbuild >= 4000) OR (@sqlmajorver = 11 AND @sqlbuild >= 3000) OR @sqlmajorver >= 12) AND (@stats_isincremental = 0 OR UPPER(@statsSample) = 'FULLSCAN' OR ISNUMERIC(@statsSample) = 1)
+				ELSE IF ((@sqlmajorver = 10 AND @sqlminorver = 50 AND @sqlbuild >= 4000) OR (@sqlmajorver = 11 AND @sqlbuild >= 3000) OR @sqlmajorver >= 12) AND (ISNULL(@stats_isincremental,1) = 0 OR UPPER(@statsSample) = 'FULLSCAN' OR ISNUMERIC(@statsSample) = 1)
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.dm_db_stats_properties DMF...', 0, 42) WITH NOWAIT;
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties(' + CAST(@statsobjectID AS NVARCHAR(10)) + ',' + CAST(@statsID AS NVARCHAR(10)) + ');'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = ISNULL(modification_counter,0), @rows_Out = ISNULL(rows,0), @rows_sampled_Out = ISNULL(rows_sampled,0) FROM sys.dm_db_stats_properties(@statsobjectID_In, @statsID_In);'
 				END
 				ELSE
 				BEGIN
 					IF @debugMode = 1
 					RAISERROR('     Using sys.sysindexes...', 0, 42) WITH NOWAIT;
 					SELECT TOP 1 @surrogateStatsID = indexID FROM dbo.tbl_AdaptiveIndexDefrag_Working (NOLOCK) WHERE objectID = @statsobjectID AND indexName = @statsName 
-					SELECT @rowmodctrSQL = N'USE ' + @dbName + '; SELECT @rowmodctr_Out = SUM(ISNULL(rowmodctr,0)), @rows_Out = ISNULL(rowcnt,0), @rows_sampled_Out = -1 FROM sys.sysindexes WHERE id = ' + CAST(@statsobjectID AS NVARCHAR(10)) + ' AND indid = ' + CAST(@surrogateStatsID AS NVARCHAR(10)) + ' AND rowmodctr > 0;'
+					SELECT @rowmodctrSQL = CASE WHEN @engineedition NOT IN (5, 6) THEN 'USE ' + @dbName ELSE '' END + '; SELECT @rowmodctr_Out = SUM(ISNULL(rowmodctr,0)), @rows_Out = ISNULL(rowcnt,0), @rows_sampled_Out = -1 FROM sys.sysindexes WHERE id = @statsobjectID_In AND indid = @statsID_In AND rowmodctr > 0;'
+
+					IF @statsID IS NULL
+					SET @statsID = @surrogateStatsID
 				END
-				SET @rowmodctrSQL_Param = N'@partitionNumber_In smallint, @rowmodctr_Out bigint OUTPUT, @rows_Out bigint OUTPUT, @rows_sampled_Out bigint OUTPUT'
+				SET @rowmodctrSQL_Param = N'@partitionNumber_In smallint, @statsobjectID_In int, @statsID_In int, @rowmodctr_Out bigint OUTPUT, @rows_Out bigint OUTPUT, @rows_sampled_Out bigint OUTPUT'
 
 				BEGIN TRY
-					EXECUTE sp_executesql @rowmodctrSQL, @rowmodctrSQL_Param, @partitionNumber_In = @partitionNumber, @rowmodctr_Out = @rowmodctr OUTPUT, @rows_Out = @rows OUTPUT, @rows_sampled_Out = @rows_sampled OUTPUT;
+					EXECUTE sp_executesql @rowmodctrSQL, @rowmodctrSQL_Param, @statsobjectID_In = @statsobjectID, @statsID_In = @statsID, @partitionNumber_In = @partitionNumber, @rowmodctr_Out = @rowmodctr OUTPUT, @rows_Out = @rows OUTPUT, @rows_sampled_Out = @rows_sampled OUTPUT;
 					SET @rowmodctr = (SELECT ISNULL(@rowmodctr, 0));
 				END TRY
 				BEGIN CATCH						
@@ -2656,7 +2677,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 				IF @debugMode = 1
 				BEGIN
-					SELECT @debugMessage = '     Found a row modification counter of ' + CONVERT(NVARCHAR(10), @rowmodctr) + ' and ' + CONVERT(NVARCHAR(10), CASE WHEN @rows IS NOT NULL AND @rows < @record_count THEN @rows ELSE @record_count END) + ' rows' + CASE WHEN @stats_isincremental = 1 THEN ' on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
+					SELECT @debugMessage = '     Found a row modification counter of ' + CONVERT(NVARCHAR(15), @rowmodctr) + ' and ' + CONVERT(NVARCHAR(15), CASE WHEN @rows IS NOT NULL AND @rows < @record_count THEN @rows ELSE @record_count END) + ' rows' + CASE WHEN @stats_isincremental = 1 THEN ' on partition ' + CONVERT(NVARCHAR(15), @partitionNumber) ELSE '' END + '...';
 					RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					--select @debugMessage
 				END
@@ -2701,7 +2722,16 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					ELSE IF @stats_norecompute = 1 AND UPPER(@sqlcommand2) NOT LIKE '%WITH%'
 					SET @sqlcommand2 = @sqlcommand2 + N' WITH NORECOMPUTE'
 					
-					/* For list of incremental stats unsupported scenarios check https://msdn.microsoft.com/en-us/library/ms187348.aspx */
+					IF @maxDopRestriction IS NOT NULL	
+						AND ((@sqlmajorver >= 14 AND @sqlbuild >= 3015) /*OR (@sqlmajorver = 13 AND @sqlbuild >= xxxx)*/) -- SQL 2016 SP2, SQL 2017 CU3 or higher for MAXDOP in stats
+						AND UPPER(@sqlcommand2) LIKE '%WITH%'
+					SET @sqlcommand2 = @sqlcommand2 + N' ,MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3));
+					ELSE IF @maxDopRestriction IS NOT NULL	
+						AND ((@sqlmajorver >= 14 AND @sqlbuild >= 3015) /*OR (@sqlmajorver = 13 AND @sqlbuild >= xxxx)*/) -- SQL 2016 SP2, SQL 2017 CU3 or higher for MAXDOP in stats
+						AND UPPER(@sqlcommand2) NOT LIKE '%WITH%'	
+					SET @sqlcommand2 = @sqlcommand2 + N' WITH MAXDOP = ' + CAST(@maxDopRestriction AS VARCHAR(3));
+					
+					/* For list of incremental stats unsupported scenarios check http://docs.microsoft.com/sql/t-sql/statements/update-statistics-transact-sql */
 					IF @partitionCount > 1 AND @statsIncremental = 1 AND @has_filter = 0
 					BEGIN
 						IF UPPER(@sqlcommand2) LIKE '%WITH%'
@@ -2738,7 +2768,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 					/* Log actions */
 					INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Stats_log (dbID, dbName, objectID, objectName, statsID, statsName, [partitionNumber], [rows], rows_sampled, modification_counter, [no_recompute], dateTimeStart, sqlStatement)		
-					SELECT @dbID, @dbName, @statsobjectID, @statsobjectName, @statsID, @statsName, @partitionNumber, @rows, @rows_sampled, @rowmodctr, @stats_norecompute, @dateTimeStart, @sqlcommand2;
+					SELECT @dbID, @dbName, @statsobjectID, @statsobjectName, @statsID, @statsName, @partitionNumber, @record_count, @rows_sampled, @rowmodctr, @stats_norecompute, @dateTimeStart, @sqlcommand2;
 					
 					SET @statsUpdate_id = SCOPE_IDENTITY();
 
@@ -2793,12 +2823,22 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					UPDATE dbo.tbl_AdaptiveIndexDefrag_Stats_Working
 					SET updateDate = GETDATE(), printStatus = 1
 					WHERE dbID = @dbID AND objectID = @statsobjectID AND statsID = @statsID AND partitionNumber = @partitionNumber;
+					
+					/* Get the time for logging purposes */
+					IF @dateTimeStart IS NULL
+					SET @dateTimeStart = GETDATE();
+					
+					/* Log actions */		
+					INSERT INTO dbo.tbl_AdaptiveIndexDefrag_Stats_log (dbID, dbName, objectID, objectName, statsID, statsName, [partitionNumber], [rows], rows_sampled, modification_counter, [no_recompute], dateTimeStart, dateTimeEnd, durationSeconds, sqlStatement)		
+					SELECT @dbID, @dbName, @objectID, @objectName, @statsID, @statsName, @partitionNumber, @record_count, ISNULL(@rows_sampled,-1), @rowmodctr, @stats_norecompute, @dateTimeStart, @dateTimeStart, -1, @sqlcommand2;
 				END
 				ELSE IF @Exec_Print = 0
 				BEGIN
 					IF @debugMode = 1 AND @sqlcommand2 IS NULL
 					BEGIN
 						SET @debugMessage = '     No need to update statistic ' + @statsName + ' on DB ' + @dbName + ' and object ' + @statsobjectName + CASE WHEN @stats_isincremental = 1 THEN ', on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
+						
+						IF @debugMessage IS NOT NULL
 						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					END
 
@@ -2806,18 +2846,22 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 					IF (@printCmds = 1 OR @debugMode = 1) AND @sqlcommand2 IS NOT NULL
 					BEGIN
 						SET @debugMessage = '     ' + @sqlcommand2;
+						
+						IF @debugMessage IS NOT NULL
 						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					END
 					
 					IF @printCmds = 1 AND @debugMode = 0 AND @sqlcommand2 IS NULL
 					BEGIN
-						 SET @debugMessage = '     -- No need to update statistic ' + @statsName + ' on DB ' + @dbName + ' and object ' + @statsobjectName + CASE WHEN @stats_isincremental = 1 THEN ', on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
-						 RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
+						SET @debugMessage = '     -- No need to update statistic ' + @statsName + ' on DB ' + @dbName + ' and object ' + @statsobjectName + CASE WHEN @stats_isincremental = 1 THEN ', on partition ' + CONVERT(NVARCHAR(10), @partitionNumber) ELSE '' END + '...';
+						
+						IF @debugMessage IS NOT NULL
+						RAISERROR(@debugMessage, 0, 42) WITH NOWAIT;
 					END
 
 					UPDATE dbo.tbl_AdaptiveIndexDefrag_Stats_Working		
 					SET printStatus = 1	
-					WHERE dbID = @dbID AND objectID = @statsobjectID AND statsID = @statsID AND partitionNumber = @partitionNumber;
+					WHERE dbID = @dbID AND objectID = @statsobjectID AND statsID = @statsID AND partitionNumber = @partitionNumber;					
 				END
 			END
 			IF (@printCmds = 1 OR @debugMode = 1)		
@@ -2882,7 +2926,7 @@ WHERE system_type_id IN (34, 35, 99) ' + CASE WHEN @sqlmajorver < 11 THEN 'OR ma
 
 	/* Drop all temp tables */
 	IF @debugMode = 1
-	RAISERROR(' Droping temporary objects', 0, 42) WITH NOWAIT;
+	RAISERROR(' Dropping temporary objects', 0, 42) WITH NOWAIT;
 	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tblIndexDefragDatabaseList'))
 	DROP TABLE #tblIndexDefragDatabaseList;
 	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tblIndexDefragmaxPartitionList'))
@@ -3052,7 +3096,7 @@ GO
 CREATE PROCEDURE usp_AdaptiveIndexDefrag_PurgeLogs @daystokeep smallint = 90
 AS
 /*
-usp_AdaptiveIndexDefrag_PurgeLogs.sql - pedro.lopes@microsoft.com (http://blogs.msdn.com/b/blogdoezequiel/)
+usp_AdaptiveIndexDefrag_PurgeLogs.sql - pedro.lopes@microsoft.com (http://aka.ms/AID)
 
 Purge log tables to avoid indefinite growth.
 Default is data older than 90 days.
@@ -3079,7 +3123,7 @@ GO
 CREATE PROCEDURE usp_AdaptiveIndexDefrag_CurrentExecStats @dbname NVARCHAR(255) = NULL
 AS
 /*
-usp_AdaptiveIndexDefrag_CurrentExecStats.sql - pedro.lopes@microsoft.com (http://blogs.msdn.com/b/blogdoezequiel/)
+usp_AdaptiveIndexDefrag_CurrentExecStats.sql - pedro.lopes@microsoft.com (http://aka.ms/AID)
 
 Allows monitoring of what has been done so far in the defrag loop.
 
@@ -3168,7 +3212,7 @@ CREATE PROCEDURE usp_AdaptiveIndexDefrag_Exceptions @exceptionMask_DB NVARCHAR(2
 	@exceptionMask_indexes NVARCHAR(500) = NULL
 AS
 /*
-usp_AdaptiveIndexDefrag_Exceptions.sql - pedro.lopes@microsoft.com (http://blogs.msdn.com/b/blogdoezequiel/)
+usp_AdaptiveIndexDefrag_Exceptions.sql - pedro.lopes@microsoft.com (http://aka.ms/AID)
 
 To insert info into the Exceptions table, use the following guidelines:
 For @exceptionMask_DB, enter only one database name at a time.
@@ -3189,7 +3233,7 @@ EXEC usp_AdaptiveIndexDefrag_Exceptions @exceptionMask_DB = 'AdventureWorks2008R
 */
 SET NOCOUNT ON;
 
-IF @exceptionMask_DB IS NULL OR QUOTENAME(@exceptionMask_DB) NOT IN (SELECT QUOTENAME(name) FROM master.sys.sysdatabases)
+IF @exceptionMask_DB IS NULL OR QUOTENAME(@exceptionMask_DB) NOT IN (SELECT QUOTENAME(name) FROM sys.databases)
 RAISERROR('Syntax error. Please input a valid database name.', 15, 42) WITH NOWAIT;
 
 IF @exceptionMask_days IS NOT NULL AND
